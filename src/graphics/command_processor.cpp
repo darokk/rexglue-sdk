@@ -46,6 +46,15 @@ REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(wait_reg_mem_poll_us, 200, "GPU",
+                     "Longest sleep, in microseconds, between polls while a WAIT_REG_MEM "
+                     "packet waits with vsync on. The guest's wait hint is whole "
+                     "milliseconds, which made the GPU command thread oversleep the counter "
+                     "it waits for (the vblank counter ticks every 1 ms when the guest "
+                     "frame rate is unlocked). 0 = sleep the full hint.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(log_guest_fps, true, "GPU",
                     "Log a guest frame rate summary every 5 seconds: average fps, the "
                     "slowest frame and how many frames took longer than 33 ms (stutters). "
@@ -1093,14 +1102,28 @@ void CommandProcessor::LogGuestFrameTiming() {
   const uint64_t presents = presenter ? presenter->present_count() : 0;
   if (REXCVAR_GET(log_guest_fps)) {
     const double seconds = std::chrono::duration<double>(window).count();
+    static constexpr const char* kSyncNames[] = {"occlusion query", "memexport readback",
+                                                 "resolve readback", "pipeline wait"};
+    std::string syncs;
+    for (uint32_t i = 0; i < uint32_t(GpuSyncKind::kCount); ++i) {
+      if (gpu_sync_count_[i]) {
+        syncs += fmt::format("{}{} {} ({:.1f} ms)", syncs.empty() ? "" : ", ", kSyncNames[i],
+                             gpu_sync_count_[i],
+                             std::chrono::duration<double, std::milli>(gpu_sync_time_[i]).count());
+      }
+    }
     REXGPU_INFO("[guest-fps] {:.1f} fps over {:.1f} s, slowest frame {:.1f} ms, {} of {} "
-                "frames over 33 ms; host presented {:.1f}/s",
+                "frames over 33 ms; host presented {:.1f}/s; GPU waits: {}",
                 fps_log_frames_ / seconds, seconds,
                 std::chrono::duration<double, std::milli>(fps_log_worst_).count(),
                 fps_log_slow_frames_, fps_log_frames_,
-                (presents - fps_log_presents_) / seconds);
+                (presents - fps_log_presents_) / seconds, syncs.empty() ? "none" : syncs);
   }
   fps_log_presents_ = presents;
+  for (uint32_t i = 0; i < uint32_t(GpuSyncKind::kCount); ++i) {
+    gpu_sync_count_[i] = 0;
+    gpu_sync_time_[i] = {};
+  }
   fps_log_window_start_ = now;
   fps_log_frames_ = 0;
   fps_log_slow_frames_ = 0;
@@ -1243,7 +1266,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          auto sleep = std::chrono::microseconds(std::chrono::milliseconds(wait / 0x100));
+          const int32_t poll_us = REXCVAR_GET(wait_reg_mem_poll_us);
+          if (poll_us > 0) {
+            sleep = std::min(sleep, std::chrono::microseconds(poll_us));
+          }
+          rex::thread::Sleep(sleep);
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

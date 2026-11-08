@@ -245,6 +245,24 @@ class CommandProcessor {
   FrameLimiter frame_limiter_;
   GuestFrameMeter guest_frame_meter_;
 
+  // Points where the command processor blocks until the GPU has finished
+  // earlier work (no CPU/GPU overlap meanwhile). Counted and timed for the
+  // log_guest_fps summary; called on the command processor thread.
+  enum class GpuSyncKind : uint32_t {
+    kOcclusionQuery,
+    kMemexportReadback,
+    kResolveReadback,
+    kPipelineWait,
+    kCount,
+  };
+  void NoteGpuSync(GpuSyncKind kind, std::chrono::steady_clock::time_point started) {
+    const uint32_t i = uint32_t(kind);
+    ++gpu_sync_count_[i];
+    gpu_sync_time_[i] += std::chrono::steady_clock::now() - started;
+  }
+  uint32_t gpu_sync_count_[uint32_t(GpuSyncKind::kCount)] = {};
+  std::chrono::steady_clock::duration gpu_sync_time_[uint32_t(GpuSyncKind::kCount)] = {};
+
   // log_guest_fps: periodic summary of guest frame (XE_SWAP) timing.
   void LogGuestFrameTiming();
   std::chrono::steady_clock::time_point fps_log_window_start_{};

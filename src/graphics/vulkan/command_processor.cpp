@@ -3886,10 +3886,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // missing for that frame and corrupts any texture rendered by the pass, so
     // wait for the real pipeline instead, as on D3D12. Only the first use of a
     // pipeline can stall, as without async compilation.
-    if (!REXCVAR_GET(async_pipeline_wait) ||
-        !pipeline_cache_->WaitForPipeline(
-            pipeline_handle,
-            uint32_t(std::max(100, REXCVAR_GET(async_pipeline_wait_timeout_ms))))) {
+    const auto pipeline_wait_start = std::chrono::steady_clock::now();
+    const bool pipeline_ready =
+        REXCVAR_GET(async_pipeline_wait) &&
+        pipeline_cache_->WaitForPipeline(
+            pipeline_handle, uint32_t(std::max(100, REXCVAR_GET(async_pipeline_wait_timeout_ms))));
+    if (REXCVAR_GET(async_pipeline_wait)) {
+      NoteGpuSync(GpuSyncKind::kPipelineWait, pipeline_wait_start);
+    }
+    if (!pipeline_ready) {
       frame_used_async_placeholder_pipeline_ = true;
       return true;
     }
@@ -4254,7 +4259,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT);
 
-  if (!AwaitAllQueueOperationsCompletion()) {
+  const auto memexport_wait_start = std::chrono::steady_clock::now();
+  const bool memexport_awaited = AwaitAllQueueOperationsCompletion();
+  NoteGpuSync(GpuSyncKind::kMemexportReadback, memexport_wait_start);
+  if (!memexport_awaited) {
     REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
     dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
     dfn.vkFreeMemory(device, readback_memory, nullptr);
@@ -4413,7 +4421,9 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     // is always one memexport draw old, whether or not the GPU has caught up.
     // A copy recorded in the still-open submission is left to the full path
     // below, as without this cvar, so the open submission is never ended here.
+    const auto fast_wait_start = std::chrono::steady_clock::now();
     CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index]);
+    NoteGpuSync(GpuSyncKind::kMemexportReadback, fast_wait_start);
   }
   bool previous_slot_ready =
       previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
@@ -4717,8 +4727,13 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
-    return true;
+  } else {
+    const auto resolve_wait_start = std::chrono::steady_clock::now();
+    const bool resolve_awaited = AwaitAllQueueOperationsCompletion();
+    NoteGpuSync(GpuSyncKind::kResolveReadback, resolve_wait_start);
+    if (!resolve_awaited) {
+      return true;
+    }
   }
 
   bool is_cache_miss = false;
@@ -4949,7 +4964,10 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
   if (!EndSubmission(false)) {
     return false;
   }
-  if (!AwaitAllQueueOperationsCompletion()) {
+  const auto query_wait_start = std::chrono::steady_clock::now();
+  const bool query_awaited = AwaitAllQueueOperationsCompletion();
+  NoteGpuSync(GpuSyncKind::kOcclusionQuery, query_wait_start);
+  if (!query_awaited) {
     return false;
   }
 
