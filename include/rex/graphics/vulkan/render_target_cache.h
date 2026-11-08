@@ -176,7 +176,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   void RequestPixelShaderInterlockBarrier() override;
 
+  // Set before Update when the draw replaces all depth and stencil in the
+  // render target (a Direct3D 9 style depth clear), so the depth transfer into
+  // the host render target can be skipped (fable2::ShouldSkipDepthTransfers).
+  void SetDepthOverwrittenByNextUpdate(bool overwritten) {
+    depth_overwritten_by_next_update_ = overwritten;
+  }
+
  private:
+  bool depth_overwritten_by_next_update_ = false;
+
   enum class EdramBufferUsage {
     // There's no need for combined fragment and compute usages.
     // With host render targets, the usual usage sequence is as follows:

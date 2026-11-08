@@ -46,6 +46,8 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "../fable2/fable2_draw_hacks.h"
+
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
@@ -3640,6 +3642,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  // These memexport shaders only read data the CPU wrote, so the CPU can give the
+  // guest their output directly. The draw still runs, only the wait to read the
+  // result back is skipped.
+  const bool memexport_computed_on_cpu =
+      fable2::ComputeMemexportOnCpu(*register_file_, *memory_, *vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -3850,6 +3857,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
+  render_target_cache_->SetDepthOverwrittenByNextUpdate(
+      fable2::ShouldSkipDepthTransfers(regs, *memory_, *vertex_shader));
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
@@ -3873,8 +3882,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
-    frame_used_async_placeholder_pipeline_ = true;
-    return true;
+    // Drawing with the placeholder (which discards every pixel) leaves objects
+    // missing for that frame and corrupts any texture rendered by the pass, so
+    // wait for the real pipeline instead, as on D3D12. Only the first use of a
+    // pipeline can stall, as without async compilation.
+    if (!REXCVAR_GET(async_pipeline_wait) ||
+        !pipeline_cache_->WaitForPipeline(
+            pipeline_handle,
+            uint32_t(std::max(100, REXCVAR_GET(async_pipeline_wait_timeout_ms))))) {
+      frame_used_async_placeholder_pipeline_ = true;
+      return true;
+    }
+    pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
+                                                  pipeline_layout_provider, &pipeline_is_placeholder);
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
@@ -3944,7 +3964,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
 
   // Update dynamic graphics pipeline state.
-  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control, pixel_shader);
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -4177,7 +4197,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
+  if (!memexport_computed_on_cpu &&
+      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
       !memexport_ranges_.empty()) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -5700,7 +5721,8 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
 
 void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                                                 bool primitive_polygonal,
-                                                reg::RB_DEPTHCONTROL normalized_depth_control) {
+                                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                const Shader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5758,6 +5780,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
         regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
             ? draw_util::kD3D10PolygonOffsetFactorUnorm24
             : draw_util::kD3D10PolygonOffsetFactorFloat24;
+    // Extra bias for a pixel shader whose geometry relies on exact depth ties
+    // in the guest's 24-bit depth (depth_bias_shader), as on D3D12, where the
+    // units are added to the integer DepthBias that this factor corresponds to.
+    depth_bias_constant_factor += float(fable2::GetShaderDepthBiasUnits(pixel_shader));
     // With non-square resolution scaling, make sure the worst-case impact is
     // reverted (slope only along the scaled axis), thus max. More bias is
     // better than less bias, because less bias means Z fighting with the

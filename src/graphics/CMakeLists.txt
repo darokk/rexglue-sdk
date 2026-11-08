@@ -20,6 +20,11 @@ set(REXGPU_XENOS_SOURCES
     command_processor.cpp
     frame_limiter.cpp
     util/draw_extent_estimator.cpp
+
+    # Fable II specific draw handling (shared by D3D12 and Vulkan)
+    fable2/fable2_draw_hacks.cpp
+    fable2/fable2_terrain_tess.cpp
+    fable2/fable2_skinning.cpp
     util/draw.cpp
     packet_disassembler.cpp
     precise_sleeper.cpp
@@ -77,8 +82,6 @@ if(REXGLUE_USE_D3D12)
     set(REXGPU_XENOS_D3D12_SOURCES
         d3d12/graphics_system.cpp
         d3d12/command_processor.cpp
-        d3d12/fable2_terrain_tess.cpp
-        d3d12/fable2_skinning.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
         d3d12/shader.cpp
