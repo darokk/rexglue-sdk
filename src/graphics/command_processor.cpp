@@ -46,6 +46,12 @@ REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(log_guest_fps, true, "GPU",
+                    "Log a guest frame rate summary every 5 seconds: average fps, the "
+                    "slowest frame and how many frames took longer than 33 ms (stutters). "
+                    "Measured at the guest's frame swap, so unaffected by host presentation.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -1062,11 +1068,51 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   return true;
 }
 
+void CommandProcessor::LogGuestFrameTiming() {
+  using Clock = std::chrono::steady_clock;
+  constexpr auto kWindow = std::chrono::seconds(5);
+  constexpr auto kSlowFrame = std::chrono::microseconds(33334);
+  const Clock::time_point now = Clock::now();
+  if (fps_log_window_start_ == Clock::time_point{}) {
+    fps_log_window_start_ = now;
+    fps_log_last_swap_ = now;
+    return;
+  }
+  const Clock::duration frame = now - fps_log_last_swap_;
+  fps_log_last_swap_ = now;
+  ++fps_log_frames_;
+  fps_log_worst_ = std::max(fps_log_worst_, frame);
+  if (frame > kSlowFrame) {
+    ++fps_log_slow_frames_;
+  }
+  const Clock::duration window = now - fps_log_window_start_;
+  if (window < kWindow) {
+    return;
+  }
+  ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
+  const uint64_t presents = presenter ? presenter->present_count() : 0;
+  if (REXCVAR_GET(log_guest_fps)) {
+    const double seconds = std::chrono::duration<double>(window).count();
+    REXGPU_INFO("[guest-fps] {:.1f} fps over {:.1f} s, slowest frame {:.1f} ms, {} of {} "
+                "frames over 33 ms; host presented {:.1f}/s",
+                fps_log_frames_ / seconds, seconds,
+                std::chrono::duration<double, std::milli>(fps_log_worst_).count(),
+                fps_log_slow_frames_, fps_log_frames_,
+                (presents - fps_log_presents_) / seconds);
+  }
+  fps_log_presents_ = presents;
+  fps_log_window_start_ = now;
+  fps_log_frames_ = 0;
+  fps_log_slow_frames_ = 0;
+  fps_log_worst_ = {};
+}
+
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   frame_limiter_.Pace(REXCVAR_GET(frame_limit));
+  LogGuestFrameTiming();
 
   // The small guest FPS readout also works in Release, where the full
   // profiling macros compile out. Shared runtime counters feed the F3 UI.

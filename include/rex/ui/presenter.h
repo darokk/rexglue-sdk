@@ -183,6 +183,10 @@ struct RawImage {
 // only to the UI thread.
 class Presenter {
  public:
+  // Host presents so far (guest output and UI repaints), for diagnostics such
+  // as comparing against the guest frame rate (log_guest_fps).
+  uint64_t present_count() const { return present_count_.load(std::memory_order_relaxed); }
+
   // May be actually called on the UI thread even if statically_from_ui_thread
   // is false, such as when the guest output is refreshed by the UI thread.
   using HostGpuLossCallback =
@@ -1073,6 +1077,7 @@ class Presenter {
   // host_frame_limit (HostFrameLimitAllows / HostFrameLimitNotePresent) is
   // used on every platform, so it is outside the Windows-only DXGI state below.
   PresentRateLimiter host_frame_limiter_;
+  std::atomic<uint64_t> present_count_{0};
 
 #if REX_PLATFORM_WIN32
   static Microsoft::WRL::ComPtr<IDXGIOutput> GetDXGIOutputForMonitor(IDXGIFactory1* factory,

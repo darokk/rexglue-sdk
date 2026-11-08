@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -243,6 +244,15 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   FrameLimiter frame_limiter_;
   GuestFrameMeter guest_frame_meter_;
+
+  // log_guest_fps: periodic summary of guest frame (XE_SWAP) timing.
+  void LogGuestFrameTiming();
+  std::chrono::steady_clock::time_point fps_log_window_start_{};
+  std::chrono::steady_clock::time_point fps_log_last_swap_{};
+  uint32_t fps_log_frames_ = 0;
+  uint32_t fps_log_slow_frames_ = 0;
+  std::chrono::steady_clock::duration fps_log_worst_{};
+  uint64_t fps_log_presents_ = 0;
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
