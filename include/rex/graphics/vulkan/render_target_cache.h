@@ -32,6 +32,13 @@ class VulkanCommandProcessor;
 
 class VulkanRenderTargetCache final : public RenderTargetCache {
  public:
+  // Set before Update when the draw replaces all depth and stencil in the
+  // render target (a Direct3D 9 style depth clear), so the depth transfer into
+  // the host render target can be skipped (fable2::ShouldSkipDepthTransfers).
+  void SetDepthOverwrittenByNextUpdate(bool overwritten) {
+    depth_overwritten_by_next_update_ = overwritten;
+  }
+
   union RenderPassKey {
     struct {
       // If emulating 2x as 4x, this is still 2x for simplicity of using this
@@ -175,13 +182,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool IsGammaFormatHostStorageSeparate() const override;
 
   void RequestPixelShaderInterlockBarrier() override;
-
-  // Set before Update when the draw replaces all depth and stencil in the
-  // render target (a Direct3D 9 style depth clear), so the depth transfer into
-  // the host render target can be skipped (fable2::ShouldSkipDepthTransfers).
-  void SetDepthOverwrittenByNextUpdate(bool overwritten) {
-    depth_overwritten_by_next_update_ = overwritten;
-  }
 
  private:
   bool depth_overwritten_by_next_update_ = false;
