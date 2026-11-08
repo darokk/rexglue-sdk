@@ -114,13 +114,24 @@ function(rex_config_postfix target)
         RELWITHDEBINFO_POSTFIX "${CMAKE_RELWITHDEBINFO_POSTFIX}")
 endfunction()
 
+# Linux x86-64 code model for the SDK and the recompiled code.
+#   medium (default): code is addressed with 32-bit PC-relative offsets, so
+#     calls between recompiled functions are plain direct calls; only data
+#     objects over 64 KiB live in the large data sections. Enough as long as
+#     the code stays under 2 GiB (Fable II: about 80 MiB).
+#   large: every call and global access goes through a 64-bit address load
+#     and an indirect call (measured: ~150k indirect vs ~120 direct calls in
+#     the recompiled code), which costs CPU time on every guest call.
+set(REXGLUE_X64_CODE_MODEL "medium" CACHE STRING
+    "x86-64 code model on Linux (medium or large, see CMakeLists.txt)")
+set_property(CACHE REXGLUE_X64_CODE_MODEL PROPERTY STRINGS medium large)
 if(NOT WIN32)
     # Use appropriate code model based on architecture
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
-        # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
         # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
         # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
-        add_compile_options(-mcmodel=large)
+        # See REXGLUE_X64_CODE_MODEL above.
+        add_compile_options(-mcmodel=${REXGLUE_X64_CODE_MODEL})
     else()
         add_compile_options(-mcmodel=small)
     endif()
