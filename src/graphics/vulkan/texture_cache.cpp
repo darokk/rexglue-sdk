@@ -707,9 +707,13 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
   aniso_filter = std::min(aniso_filter, max_anisotropy_);
-  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
-      aniso_filter != xenos::AnisoFilter::kDisabled) {
-    // Check if the texture is actually filterable on the host.
+
+  // The fetch-derived inputs only change when the fetch constant does.
+  SamplerFetchMemo& memo = sampler_fetch_memo_[binding.fetch_constant & 31];
+  static_assert(sizeof(fetch) == sizeof(memo.dwords));
+  if (!memo.valid || std::memcmp(memo.dwords, &fetch, sizeof(memo.dwords))) {
+    std::memcpy(memo.dwords, &fetch, sizeof(memo.dwords));
+    memo.valid = true;
     bool linear_filterable = true;
     TextureKey texture_key;
     uint8_t texture_swizzled_signs;
@@ -725,7 +729,16 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     } else {
       linear_filterable = false;
     }
-    if (!linear_filterable) {
+    memo.linear_filterable = linear_filterable;
+    texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
+                                                   nullptr, &memo.mip_min_level,
+                                                   &memo.mip_max_level);
+  }
+
+  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
+      aniso_filter != xenos::AnisoFilter::kDisabled) {
+    // Check if the texture is actually filterable on the host.
+    if (!memo.linear_filterable) {
       parameters.mag_linear = 0;
       parameters.min_linear = 0;
       parameters.mip_linear = 0;
@@ -736,9 +749,7 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   bool mip_filter_bilinear_or_trilinear =
       mip_filter == xenos::TextureFilter::kPoint || mip_filter == xenos::TextureFilter::kLinear;
   parameters.mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
-  uint32_t mip_min_level, mip_max_level;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                                 &mip_min_level, &mip_max_level);
+  uint32_t mip_min_level = memo.mip_min_level, mip_max_level = memo.mip_max_level;
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
   int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);

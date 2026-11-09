@@ -375,6 +375,18 @@ class VulkanTextureCache final : public TextureCache {
 
   xenos::AnisoFilter max_anisotropy_;
 
+  // Per fetch constant memo of the fetch-derived parts of GetSamplerParameters
+  // (host linear filterability and the mip range), which otherwise re-decode
+  // the whole texture key for every sampler of every draw.
+  struct SamplerFetchMemo {
+    uint32_t dwords[6];
+    bool valid;
+    bool linear_filterable;
+    uint32_t mip_min_level;
+    uint32_t mip_max_level;
+  };
+  mutable SamplerFetchMemo sampler_fetch_memo_[32] = {};
+
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;

@@ -53,6 +53,14 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_resolve_force_delayed, false, "GPU",
+                    "Read back resolves forced by readback_resolve_force_addresses one resolve "
+                    "late (double-buffered, like readback_resolve = fast) instead of waiting for "
+                    "the GPU to go idle at every one. Saves a full CPU/GPU sync per resolve when "
+                    "the game regenerates such a texture every frame; wrong if the game expects "
+                    "each resolve's own result immediately (Vulkan only).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2137,6 +2145,12 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 &&
+      register_file_->values[index] == value) {
+    // Identical fetch constant write - nothing derived from it changes.
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2244,11 +2258,32 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    // Games commonly re-upload whole fetch constant blocks every draw with
+    // mostly identical contents. Only invalidate what actually changed, so the
+    // texture bindings, the fetch constant buffer and vertex buffer residency
+    // aren't recomputed for identical writes.
+    uint32_t* dest = register_file_->values + start_index;
+    uint32_t first_changed = UINT32_MAX, last_changed = 0;
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      uint32_t value;
+      std::memcpy(&value, base + i, sizeof(value));
+      value = rex::byte_swap(value);
+      if (dest[i] != value) {
+        dest[i] = value;
+        if (first_changed == UINT32_MAX) {
+          first_changed = i;
+        }
+        last_changed = i;
+      }
+    }
+    if (first_changed == UINT32_MAX) {
+      return;
+    }
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
-    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t first_fetch_dword =
+        start_index + first_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t last_fetch_dword = start_index + last_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
@@ -4722,8 +4757,12 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 
+  // Reaching here with readback disabled means this resolve was forced by
+  // readback_resolve_force_addresses.
+  const bool forced = readback_mode == ReadbackResolveMode::kDisabled;
   bool use_delayed_sync =
-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome ||
+      (forced && REXCVAR_GET(readback_resolve_force_delayed));
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
