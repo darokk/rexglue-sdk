@@ -9,6 +9,7 @@
  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
  */
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -32,6 +33,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
+#include <rex/pgo.h>
 #include <rex/platform.h>
 #include <rex/string.h>
 
@@ -338,7 +340,31 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
   }
 }
 
+namespace {
+std::atomic<uint64_t> g_protect_calls{0};
+std::atomic<uint64_t> g_protect_bytes{0};
+std::atomic<uint64_t> g_watch_faults{0};
+}  // namespace
+
+ProtectStats GetProtectStats() {
+  return {g_protect_calls.load(std::memory_order_relaxed),
+          g_protect_bytes.load(std::memory_order_relaxed),
+          g_watch_faults.load(std::memory_order_relaxed)};
+}
+
+void NoteWatchFault() { g_watch_faults.fetch_add(1, std::memory_order_relaxed); }
+
+bool WriteRuntimeProfile() {
+#if defined(__linux__)
+  return rex::pgo::WriteModuleProfile();
+#else
+  return false;
+#endif
+}
+
 bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* out_old_access) {
+  g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+  g_protect_bytes.fetch_add(length, std::memory_order_relaxed);
   if (out_old_access) {
     *out_old_access = PageAccess::kNoAccess;
   }

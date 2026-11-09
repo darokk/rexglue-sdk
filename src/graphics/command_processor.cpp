@@ -54,6 +54,7 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/pgo.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
@@ -841,6 +842,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  ++work_stats_.packets;
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -1251,6 +1253,7 @@ struct HostPerfState {
   uint32_t prof_reports = 0;
   std::unordered_map<std::string, ModuleSymbols> prof_modules;
   std::unordered_map<uintptr_t, std::string> prof_pc_names;
+  rex::memory::ProtectStats protect_reported = {};
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1470,7 +1473,47 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
   }
   s.gpu_busy_sum = 0;
   s.gpu_busy_samples = 0;
-  if (++s.prof_reports % 6 == 0) out += ProfReport(s);  // every 30 s
+
+  // Host work per guest frame since the last report.
+  const double frames = std::max(1.0, double(fps_log_frames_));
+  const WorkStats& w = work_stats_;
+  const WorkStats& p = work_stats_reported_;
+  auto per_frame = [&](uint64_t now_value, uint64_t then_value) {
+    return uint64_t(double(now_value - then_value) / frames + 0.5);
+  };
+  const rex::memory::ProtectStats protect = rex::memory::GetProtectStats();
+  out += fmt::format(
+      "\n         per frame: {} draws, {} packets, {} pipeline binds, {} render passes, "
+      "{:.1f} submissions | texture sets {} written {} reused, constant sets {}, set binds {} | "
+      "uploads sys {} vs {} ps {} bool {} fetch {} | mprotect {} ({} KB), watch faults {}",
+      per_frame(w.draws, p.draws), per_frame(w.packets, p.packets),
+      per_frame(w.pipeline_binds, p.pipeline_binds), per_frame(w.render_passes, p.render_passes),
+      double(w.submissions - p.submissions) / frames,
+      per_frame(w.texture_sets_written, p.texture_sets_written),
+      per_frame(w.texture_sets_reused, p.texture_sets_reused),
+      per_frame(w.constant_sets_written, p.constant_sets_written),
+      per_frame(w.descriptor_set_binds, p.descriptor_set_binds),
+      per_frame(w.constant_uploads[0], p.constant_uploads[0]),
+      per_frame(w.constant_uploads[1], p.constant_uploads[1]),
+      per_frame(w.constant_uploads[2], p.constant_uploads[2]),
+      per_frame(w.constant_uploads[3], p.constant_uploads[3]),
+      per_frame(w.constant_uploads[4], p.constant_uploads[4]),
+      per_frame(protect.protect_calls, s.protect_reported.protect_calls),
+      per_frame(protect.protect_bytes, s.protect_reported.protect_bytes) / 1024,
+      per_frame(protect.watch_faults, s.protect_reported.watch_faults));
+  work_stats_reported_ = work_stats_;
+  s.protect_reported = protect;
+
+  if (++s.prof_reports % 6 == 0) {  // every 30 s
+    out += ProfReport(s);
+    // PGO-instrumented builds: save the profile counters of both libraries.
+    const bool gpu_profile = rex::pgo::WriteModuleProfile();
+    const bool runtime_profile = rex::memory::WriteRuntimeProfile();
+    if (gpu_profile || runtime_profile) {
+      out += fmt::format("\n         PGO profile data saved (graphics {}, runtime {})",
+                         gpu_profile ? "yes" : "no", runtime_profile ? "yes" : "no");
+    }
+  }
   return out;
 }
 

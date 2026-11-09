@@ -263,6 +263,24 @@ class CommandProcessor {
   uint32_t gpu_sync_count_[uint32_t(GpuSyncKind::kCount)] = {};
   std::chrono::steady_clock::duration gpu_sync_time_[uint32_t(GpuSyncKind::kCount)] = {};
 
+  // Running totals of per-draw host work for the performance log (averaged
+  // per guest frame there). Only touched on the command processor thread.
+  struct WorkStats {
+    uint64_t packets;
+    uint64_t draws;
+    uint64_t pipeline_binds;
+    uint64_t render_passes;
+    uint64_t submissions;
+    uint64_t texture_sets_written;
+    uint64_t texture_sets_reused;
+    uint64_t constant_sets_written;
+    uint64_t descriptor_set_binds;
+    // System, vertex float, pixel float, bool/loop, fetch.
+    uint64_t constant_uploads[5];
+  };
+  WorkStats work_stats_ = {};
+  WorkStats work_stats_reported_ = {};
+
   // log_guest_fps: periodic summary of guest frame (XE_SWAP) timing.
   void LogGuestFrameTiming();
   // Host CPU/GPU sampling for that summary and perf_log.txt (Linux; no-ops

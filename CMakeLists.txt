@@ -273,6 +273,44 @@ add_subdirectory(src/kernel)
 add_subdirectory(src/codegen)
 add_subdirectory(src/rexglue)
 
+# Profile-guided optimization of the runtime libraries (clang, non-Windows).
+# GENERATE builds instrumented libraries that write .profraw files while the
+# game runs (LLVM_PROFILE_FILE); merge them with llvm-profdata into a .profdata
+# file and build again with USE and REXGLUE_PGO_PROFILE pointing to it. The
+# recompiled game code itself is not instrumented.
+set(REXGLUE_PGO "OFF" CACHE STRING "Profile-guided optimization: OFF, GENERATE or USE")
+set_property(CACHE REXGLUE_PGO PROPERTY STRINGS OFF GENERATE USE)
+set(REXGLUE_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata file for REXGLUE_PGO=USE")
+if(NOT REXGLUE_PGO STREQUAL "OFF")
+    if(WIN32 OR NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "REXGLUE_PGO needs clang on a non-Windows platform")
+    endif()
+    if(REXGLUE_PGO STREQUAL "GENERATE")
+        set(REXGLUE_PGO_COMPILE_FLAGS -fprofile-generate)
+        set(REXGLUE_PGO_LINK_FLAGS -fprofile-generate)
+    elseif(REXGLUE_PGO STREQUAL "USE")
+        if(NOT EXISTS "${REXGLUE_PGO_PROFILE}")
+            message(FATAL_ERROR "REXGLUE_PGO=USE needs REXGLUE_PGO_PROFILE (got '${REXGLUE_PGO_PROFILE}')")
+        endif()
+        set(REXGLUE_PGO_COMPILE_FLAGS "-fprofile-use=${REXGLUE_PGO_PROFILE}"
+            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+        set(REXGLUE_PGO_LINK_FLAGS "-fprofile-use=${REXGLUE_PGO_PROFILE}")
+    else()
+        message(FATAL_ERROR "REXGLUE_PGO must be OFF, GENERATE or USE (got '${REXGLUE_PGO}')")
+    endif()
+    foreach(pgo_target rexcore rexfilesystem rexui rexinput rexaudio rexkernel rexruntime
+                       rexgpu-xenos)
+        if(TARGET ${pgo_target})
+            target_compile_options(${pgo_target} PRIVATE ${REXGLUE_PGO_COMPILE_FLAGS})
+            get_target_property(pgo_target_type ${pgo_target} TYPE)
+            if(pgo_target_type STREQUAL "SHARED_LIBRARY")
+                target_link_options(${pgo_target} PRIVATE ${REXGLUE_PGO_LINK_FLAGS})
+            endif()
+        endif()
+    endforeach()
+    message(STATUS "ReXGlue PGO: ${REXGLUE_PGO} ${REXGLUE_PGO_PROFILE}")
+endif()
+
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)
     enable_testing()

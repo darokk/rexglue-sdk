@@ -609,9 +609,24 @@ class VulkanCommandProcessor : public CommandProcessor {
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeConstants;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
+  static constexpr uint32_t kConstantsDescriptorPoolSetCount = 1024;
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
+  // Guest draw constants are dynamic uniform buffers: a constants descriptor
+  // set only depends on which upload pool pages (VkBuffers) hold the constants,
+  // and the per-draw locations within them are dynamic offsets. Sets are
+  // reused for the whole frame (cleared on frame open, as their lifetime is
+  // tracked per frame in constants_transient_descriptors_used_).
+  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_constants_;
+  struct ConstantsDescriptorSet {
+    VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount];
+    VkDescriptorSet set;
+  };
+  std::vector<ConstantsDescriptorSet> constants_descriptor_sets_frame_;
+  VkBuffer current_constants_set_buffers_[SpirvShaderTranslator::kConstantBufferCount] = {};
+  uint32_t current_constants_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount] = {};
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
       single_transient_descriptors_free_;
@@ -841,6 +856,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
   // up-to-date data.
   uint32_t current_graphics_descriptor_set_values_up_to_date_;
+  // All vertex [0] and pixel [1] texture descriptor sets written in the
+  // current submission, by a hash of their contents, so draws with identical
+  // textures and samplers reuse them. Only valid within the submission they
+  // were written in (textures they reference can't be destroyed while that
+  // submission is pending).
+  struct TextureDescriptorSetCacheEntry {
+    VkDescriptorSetLayout layout;
+    std::vector<VkDescriptorImageInfo> image_infos;
+    VkDescriptorSet set;
+  };
+  std::unordered_map<uint64_t, TextureDescriptorSetCacheEntry> texture_descriptor_set_cache_[2];
+  uint64_t texture_descriptor_set_cache_submission_ = UINT64_MAX;
+  // The entry of the set currently in current_graphics_descriptor_sets_ for
+  // each stage (checked first, without hashing). Map nodes are stable.
+  const TextureDescriptorSetCacheEntry* last_texture_descriptor_set_entries_[2] = {};
   // Whether the descriptor sets currently bound to the command buffer - only
   // low bits for the descriptor set layouts that remained the same are kept
   // when changing the pipeline layout. May be out of sync with

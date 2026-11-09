@@ -676,6 +676,21 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
+  // The result only depends on the fetch constant, the binding's filter
+  // overrides and anisotropic_override - reuse it while they're unchanged.
+  SamplerFetchMemo& memo = sampler_fetch_memo_[binding.fetch_constant & 31];
+  static_assert(sizeof(fetch) == sizeof(memo.dwords));
+  const uint32_t binding_filters = uint32_t(binding.mag_filter) | (uint32_t(binding.min_filter) << 8) |
+                                   (uint32_t(binding.mip_filter) << 16) |
+                                   (uint32_t(binding.aniso_filter) << 24);
+  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  const bool fetch_unchanged =
+      memo.valid && !std::memcmp(memo.dwords, &fetch, sizeof(memo.dwords));
+  if (fetch_unchanged && memo.result_valid && memo.result_binding_filters == binding_filters &&
+      memo.result_anisotropic_override == anisotropic_override) {
+    return memo.result;
+  }
+
   SamplerParameters parameters;
 
   xenos::ClampMode fetch_clamp_x, fetch_clamp_y, fetch_clamp_z;
@@ -709,9 +724,7 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   aniso_filter = std::min(aniso_filter, max_anisotropy_);
 
   // The fetch-derived inputs only change when the fetch constant does.
-  SamplerFetchMemo& memo = sampler_fetch_memo_[binding.fetch_constant & 31];
-  static_assert(sizeof(fetch) == sizeof(memo.dwords));
-  if (!memo.valid || std::memcmp(memo.dwords, &fetch, sizeof(memo.dwords))) {
+  if (!fetch_unchanged) {
     std::memcpy(memo.dwords, &fetch, sizeof(memo.dwords));
     memo.valid = true;
     bool linear_filterable = true;
@@ -752,7 +765,6 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   uint32_t mip_min_level = memo.mip_min_level, mip_max_level = memo.mip_max_level;
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
-  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
       !parameters.mip_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
@@ -766,6 +778,10 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   }
   parameters.aniso_filter = aniso_filter;
 
+  memo.result_valid = true;
+  memo.result_binding_filters = binding_filters;
+  memo.result_anisotropic_override = anisotropic_override;
+  memo.result = parameters;
   return parameters;
 }
 
@@ -773,10 +789,22 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   assert_true(command_processor_.submission_open());
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
 
+  // Already used in this submission - already at the end of the LRU queue.
+  UseSamplerMemo& memo =
+      use_sampler_memo_[(parameters.value ^ (parameters.value >> 6) ^ (parameters.value >> 12)) &
+                        (rex::countof(use_sampler_memo_) - 1)];
+  if (memo.submission == submission_current && memo.parameters == parameters.value) {
+    has_overflown_out = false;
+    return memo.sampler;
+  }
+
   // Try to find an existing sampler.
   auto it_existing = samplers_.find(parameters);
   if (it_existing != samplers_.end()) {
     std::pair<const SamplerParameters, Sampler>& sampler = *it_existing;
+    memo.submission = submission_current;
+    memo.parameters = parameters.value;
+    memo.sampler = sampler.second.sampler;
     assert_true(sampler.second.last_usage_submission <= submission_current);
     // This is called very frequently, don't relink unless needed for caching.
     if (sampler.second.last_usage_submission < submission_current) {
@@ -1878,6 +1906,14 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
     is_array = false;
   }
 
+  // Usually the same view as last time (views are never destroyed before the
+  // texture).
+  const uint32_t view_inputs = UINT32_C(0x80000000) | uint32_t(is_signed) | (host_swizzle << 1) |
+                               (uint32_t(is_array) << 30);
+  if (last_view_inputs_ == view_inputs) {
+    return last_view_;
+  }
+
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
 
@@ -1910,6 +1946,8 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
   // Try to find an existing view.
   auto it = views_.find(view_key);
   if (it != views_.end()) {
+    last_view_inputs_ = view_inputs;
+    last_view_ = it->second;
     return it->second;
   }
 
@@ -1952,6 +1990,8 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
     return VK_NULL_HANDLE;
   }
   views_.emplace(view_key, view);
+  last_view_inputs_ = view_inputs;
+  last_view_ = view;
   return view;
 }
 

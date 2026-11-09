@@ -266,6 +266,9 @@ class VulkanTextureCache final : public TextureCache {
     Usage usage_ = Usage::kUndefined;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
+    // GetView inputs (with the top bit set when valid) and the view they gave.
+    uint32_t last_view_inputs_ = 0;
+    VkImageView last_view_ = VK_NULL_HANDLE;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
@@ -384,8 +387,22 @@ class VulkanTextureCache final : public TextureCache {
     bool linear_filterable;
     uint32_t mip_min_level;
     uint32_t mip_max_level;
+    // The whole result for one binding's filter overrides.
+    bool result_valid;
+    uint32_t result_binding_filters;
+    int32_t result_anisotropic_override;
+    SamplerParameters result;
   };
   mutable SamplerFetchMemo sampler_fetch_memo_[32] = {};
+
+  // Direct-mapped memo of UseSampler results within the current submission
+  // (a sampler used in the current submission can't be destroyed).
+  struct UseSamplerMemo {
+    uint64_t submission = UINT64_MAX;
+    uint32_t parameters = 0;
+    VkSampler sampler = VK_NULL_HANDLE;
+  };
+  UseSamplerMemo use_sampler_memo_[64];
 
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;

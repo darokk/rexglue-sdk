@@ -108,6 +108,21 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
 bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access = nullptr);
 
+#if !REX_PLATFORM_WIN32
+// Running totals for the performance log: Protect calls and bytes protected,
+// and write faults on pages watched for GPU invalidation.
+struct ProtectStats {
+  uint64_t protect_calls;
+  uint64_t protect_bytes;
+  uint64_t watch_faults;
+};
+ProtectStats GetProtectStats();
+void NoteWatchFault();
+// Writes the runtime library's PGO profile counters (rex/pgo.h); false when
+// it's not an instrumented build.
+bool WriteRuntimeProfile();
+#endif
+
 // Queries a region of pages to get the access rights. This will modify the
 // length parameter to the length of pages with the same consecutive access
 // rights. The length will start from the first byte of the first page of
