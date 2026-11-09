@@ -311,6 +311,19 @@ if(NOT REXGLUE_PGO STREQUAL "OFF")
     message(STATUS "ReXGlue PGO: ${REXGLUE_PGO} ${REXGLUE_PGO_PROFILE}")
 endif()
 
+# ThinLTO for the GPU plugin, where the hot per-draw code is (clang + lld,
+# non-Windows). Only this library: the OBJECT libraries that make up the
+# runtime are also linked into targets that aren't built with LTO.
+option(REXGLUE_LTO "ThinLTO for the GPU plugin library (clang, lld)" OFF)
+if(REXGLUE_LTO)
+    if(WIN32 OR NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "REXGLUE_LTO needs clang on a non-Windows platform")
+    endif()
+    target_compile_options(rexgpu-xenos PRIVATE -flto=thin)
+    target_link_options(rexgpu-xenos PRIVATE -flto=thin -fuse-ld=lld)
+    message(STATUS "ReXGlue LTO: ThinLTO for rexgpu-xenos")
+endif()
+
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)
     enable_testing()
