@@ -265,6 +265,11 @@ class CommandProcessor {
 
   // log_guest_fps: periodic summary of guest frame (XE_SWAP) timing.
   void LogGuestFrameTiming();
+  // Host CPU/GPU sampling for that summary and perf_log.txt (Linux; no-ops
+  // elsewhere).
+  void HostPerfSampleFrame();
+  std::string HostPerfReport(double seconds);
+  void HostPerfFileWrite(const std::string& fps_line, const std::string& host);
   std::chrono::steady_clock::time_point fps_log_window_start_{};
   std::chrono::steady_clock::time_point fps_log_last_swap_{};
   uint32_t fps_log_frames_ = 0;

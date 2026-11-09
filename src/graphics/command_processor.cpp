@@ -17,6 +17,26 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#if defined(__linux__)
+#include <cxxabi.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include <atomic>
+
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#endif
 
 #include <fmt/format.h>
 
@@ -53,6 +73,18 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_poll_us, 200, "GPU",
                      "it waits for (the vblank counter ticks every 1 ms when the guest "
                      "frame rate is unlocked). 0 = sleep the full hint.")
     .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(log_perf_file, true, "GPU",
+                    "With log_guest_fps, also write the 5-second summaries, with CPU time per "
+                    "thread and CPU/GPU clocks, to perf_log.txt next to the executable "
+                    "(Linux; replaced at every launch)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(log_perf_profile, true, "GPU",
+                    "With log_perf_file, sample the GPU command thread and the main game thread "
+                    "(1 sample per ms of their CPU time) and add their busiest functions to "
+                    "perf_log.txt every 30 s (Linux; needs a restart to turn on)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(log_guest_fps, true, "GPU",
@@ -1077,6 +1109,410 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   return true;
 }
 
+// --- Host performance sampling for the log_guest_fps summary (Linux) ---------
+// Every 5 s: CPU time per thread (busiest first), CPU clocks, and the GPU's
+// average utilisation and current clock. Also written, with the frame rate
+// line, to perf_log.txt next to the executable (log_perf_file), a short file
+// meant to be shared when reporting performance. Runs on the command
+// processor thread; reading /proc and sysfs a few times per second is cheap.
+#if defined(__linux__)
+namespace {
+
+std::string ReadSmallFile(const std::string& path) {
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return {};
+  char buf[4096];
+  const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+  std::fclose(f);
+  return std::string(buf, n);
+}
+
+// --- Built-in sampling profiler (perf_log.txt) --------------------------------
+// A per-thread CPU-time timer (SIGPROF, 1 ms of that thread's CPU time) on the
+// GPU command thread and the main game thread records the interrupted
+// instruction address into a ring buffer. Every 30 s the addresses are mapped
+// to function names (from the modules' ELF symbol tables, which the packaged
+// binaries keep) and the top functions per thread are written to the log.
+constexpr int kProfThreads = 2;  // 0 = GPU Commands, 1 = GameThread
+constexpr uint32_t kProfRing = 1u << 16;
+const char* const kProfThreadPrefix[kProfThreads] = {"GPU Commands", "GameThread"};
+
+struct ProfRing {
+  std::atomic<uint32_t> head{0};
+  uintptr_t pc[kProfRing];
+};
+ProfRing g_prof_rings[kProfThreads];
+
+void ProfSignalHandler(int, siginfo_t* info, void* uc_void) {
+  const int idx = info->si_value.sival_int;
+  if (idx < 0 || idx >= kProfThreads) return;
+  const auto* uc = static_cast<const ucontext_t*>(uc_void);
+#if defined(__x86_64__)
+  const uintptr_t pc = uintptr_t(uc->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+  const uintptr_t pc = uintptr_t(uc->uc_mcontext.pc);
+#else
+  const uintptr_t pc = 0;
+#endif
+  ProfRing& r = g_prof_rings[idx];
+  const uint32_t at = r.head.fetch_add(1, std::memory_order_relaxed);
+  r.pc[at & (kProfRing - 1)] = pc;
+}
+
+// Function symbols of one loaded module, from its ELF .symtab (or .dynsym).
+struct ModuleSymbols {
+  struct Sym {
+    uintptr_t start, size;
+    std::string name;
+  };
+  std::vector<Sym> syms;  // sorted by start (offsets from the load base)
+  const Sym* Find(uintptr_t off) const {
+    auto it = std::upper_bound(syms.begin(), syms.end(), off,
+                               [](uintptr_t v, const Sym& s) { return v < s.start; });
+    if (it == syms.begin()) return nullptr;
+    --it;
+    return off < it->start + std::max<uintptr_t>(it->size, 1) ? &*it : nullptr;
+  }
+};
+
+ModuleSymbols LoadModuleSymbols(const char* path) {
+  ModuleSymbols out;
+  std::FILE* f = std::fopen(path, "rb");
+  if (!f) return out;
+  std::vector<uint8_t> data;
+  std::fseek(f, 0, SEEK_END);
+  data.resize(size_t(std::ftell(f)));
+  std::fseek(f, 0, SEEK_SET);
+  const bool ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+  std::fclose(f);
+  if (!ok || data.size() < sizeof(Elf64_Ehdr)) return out;
+  const auto* eh = reinterpret_cast<const Elf64_Ehdr*>(data.data());
+  if (std::memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+      eh->e_shoff + uint64_t(eh->e_shnum) * sizeof(Elf64_Shdr) > data.size()) {
+    return out;
+  }
+  const auto* sh = reinterpret_cast<const Elf64_Shdr*>(data.data() + eh->e_shoff);
+  for (int pass = 0; pass < 2 && out.syms.empty(); ++pass) {
+    const uint32_t want = pass == 0 ? SHT_SYMTAB : SHT_DYNSYM;
+    for (int i = 0; i < eh->e_shnum; ++i) {
+      if (sh[i].sh_type != want || sh[i].sh_link >= eh->e_shnum) continue;
+      const Elf64_Shdr& strs = sh[sh[i].sh_link];
+      if (sh[i].sh_offset + sh[i].sh_size > data.size() ||
+          strs.sh_offset + strs.sh_size > data.size()) {
+        continue;
+      }
+      const auto* sym = reinterpret_cast<const Elf64_Sym*>(data.data() + sh[i].sh_offset);
+      const size_t n = sh[i].sh_size / sizeof(Elf64_Sym);
+      for (size_t k = 0; k < n; ++k) {
+        if (ELF64_ST_TYPE(sym[k].st_info) != STT_FUNC || sym[k].st_value == 0 ||
+            sym[k].st_name >= strs.sh_size) {
+          continue;
+        }
+        out.syms.push_back({uintptr_t(sym[k].st_value), uintptr_t(sym[k].st_size),
+                            reinterpret_cast<const char*>(data.data() + strs.sh_offset +
+                                                          sym[k].st_name)});
+      }
+    }
+  }
+  std::sort(out.syms.begin(), out.syms.end(),
+            [](const ModuleSymbols::Sym& a, const ModuleSymbols::Sym& b) {
+              return a.start < b.start;
+            });
+  return out;
+}
+
+std::string ShortFunctionName(const std::string& mangled) {
+  int status = 0;
+  char* demangled = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+  std::string name = status == 0 && demangled ? demangled : mangled;
+  std::free(demangled);
+  // Drop "(anonymous namespace)::" (its parentheses would cut the name short)
+  // and the parameter list, to keep log lines readable.
+  for (size_t at; (at = name.find("(anonymous namespace)::")) != std::string::npos;) {
+    name.erase(at, sizeof("(anonymous namespace)::") - 1);
+  }
+  if (const size_t paren = name.find('('); paren != std::string::npos) name.resize(paren);
+  if (name.size() > 60) name = "..." + name.substr(name.size() - 57);
+  return name;
+}
+
+struct HostPerfState {
+  int gpu_busy_fd = -2;  // -2 = not opened yet, -1 = unavailable
+  std::string gpu_dir;   // /sys/class/drm/cardN/device
+  uint64_t gpu_busy_sum = 0;
+  uint32_t gpu_busy_samples = 0;
+  std::unordered_map<int, uint64_t> prev_ticks;  // tid -> utime + stime
+  std::FILE* file = nullptr;
+  bool file_failed = false;
+  // Profiler.
+  bool prof_handler_installed = false;
+  int prof_tid[kProfThreads] = {};
+  uint32_t prof_consumed[kProfThreads] = {};
+  uint32_t prof_reports = 0;
+  std::unordered_map<std::string, ModuleSymbols> prof_modules;
+  std::unordered_map<uintptr_t, std::string> prof_pc_names;
+};
+
+// Starts the per-thread profiling timers once the threads exist.
+void ProfEnsureTimers(HostPerfState& s) {
+  if (!REXCVAR_GET(log_perf_profile)) return;
+  if (!s.prof_handler_installed) {
+    struct sigaction sa = {};
+    sa.sa_sigaction = ProfSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, nullptr) != 0) return;
+    s.prof_handler_installed = true;
+  }
+  DIR* dir = ::opendir("/proc/self/task");
+  if (!dir) return;
+  while (const dirent* e = ::readdir(dir)) {
+    const int tid = std::atoi(e->d_name);
+    if (tid <= 0) continue;
+    const std::string comm = ReadSmallFile(fmt::format("/proc/self/task/{}/comm", tid));
+    for (int i = 0; i < kProfThreads; ++i) {
+      if (s.prof_tid[i] != 0 || comm.rfind(kProfThreadPrefix[i], 0) != 0) continue;
+      // The CPU-time clock of another thread (MAKE_THREAD_CPUCLOCK, SCHED).
+      const clockid_t clock = clockid_t((~unsigned(tid)) << 3) | 6;
+      struct sigevent sev = {};
+      sev.sigev_notify = SIGEV_THREAD_ID;
+      sev.sigev_signo = SIGPROF;
+      sev.sigev_value.sival_int = i;
+      sev._sigev_un._tid = tid;
+      timer_t timer;
+      if (timer_create(clock, &sev, &timer) != 0) continue;
+      struct itimerspec spec = {};
+      spec.it_interval.tv_nsec = 1000000;  // every 1 ms of that thread's CPU time
+      spec.it_value.tv_nsec = 1000000;
+      if (timer_settime(timer, 0, &spec, nullptr) != 0) {
+        timer_delete(timer);
+        continue;
+      }
+      s.prof_tid[i] = tid;
+      s.prof_consumed[i] = g_prof_rings[i].head.load(std::memory_order_relaxed);
+    }
+  }
+  ::closedir(dir);
+}
+
+// Function name for a sampled PC (mangled; shortened when printed).
+std::string ProfResolvePc(HostPerfState& s, uintptr_t pc) {
+  Dl_info info = {};
+  if (!pc || !dladdr(reinterpret_cast<void*>(pc), &info) || !info.dli_fname) {
+    return "[unknown]";
+  }
+  auto it = s.prof_modules.find(info.dli_fname);
+  if (it == s.prof_modules.end()) {
+    // The main program may be reported by a relative or empty name.
+    const char* file = std::strchr(info.dli_fname, '/') ? info.dli_fname : "/proc/self/exe";
+    it = s.prof_modules.emplace(info.dli_fname, LoadModuleSymbols(file)).first;
+  }
+  const uintptr_t off = pc - uintptr_t(info.dli_fbase);
+  if (const ModuleSymbols::Sym* sym = it->second.Find(off)) {
+    return sym->name;
+  }
+  if (info.dli_sname) {
+    return info.dli_sname;
+  }
+  const char* slash = std::strrchr(info.dli_fname, '/');
+  return std::string("[") + (slash ? slash + 1 : info.dli_fname) + "]";
+}
+
+// Top functions per profiled thread since the last report ("" when nothing).
+std::string ProfReport(HostPerfState& s) {
+  std::string out;
+  for (int i = 0; i < kProfThreads; ++i) {
+    if (!s.prof_tid[i]) continue;
+    ProfRing& r = g_prof_rings[i];
+    const uint32_t head = r.head.load(std::memory_order_acquire);
+    uint32_t from = s.prof_consumed[i];
+    if (head - from > kProfRing) from = head - kProfRing;
+    s.prof_consumed[i] = head;
+    const uint32_t total = head - from;
+    if (!total) continue;
+    // Aggregate by raw PC first, then resolve each unique PC once (cached
+    // across reports) - dladdr per sample stalled this thread for ~0.7 s.
+    std::unordered_map<uintptr_t, uint32_t> pc_counts;
+    pc_counts.reserve(4096);
+    for (uint32_t k = from; k != head; ++k) {
+      ++pc_counts[r.pc[k & (kProfRing - 1)]];
+    }
+    std::unordered_map<std::string, uint32_t> counts;
+    for (const auto& [pc, count] : pc_counts) {
+      auto cached = s.prof_pc_names.find(pc);
+      if (cached == s.prof_pc_names.end()) {
+        cached = s.prof_pc_names.emplace(pc, ProfResolvePc(s, pc)).first;
+      }
+      counts[cached->second] += count;
+    }
+    std::vector<std::pair<std::string, uint32_t>> top(counts.begin(), counts.end());
+    std::sort(top.begin(), top.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    out += fmt::format("\n         profile {} ({} samples, last 30 s):", kProfThreadPrefix[i],
+                       total);
+    for (size_t k = 0; k < top.size() && k < 25; ++k) {
+      out += fmt::format("\n           {:5.1f}%  {}", 100.0 * top[k].second / total,
+                         ShortFunctionName(top[k].first));
+    }
+  }
+  return out;
+}
+HostPerfState& HostPerf() {
+  static HostPerfState state;
+  return state;
+}
+
+}  // namespace
+
+void CommandProcessor::HostPerfSampleFrame() {
+  HostPerfState& s = HostPerf();
+  if (s.gpu_busy_fd == -2) {
+    s.gpu_busy_fd = -1;
+    for (int i = 0; i < 8 && s.gpu_busy_fd < 0; ++i) {
+      const std::string dir = fmt::format("/sys/class/drm/card{}/device", i);
+      const int fd = ::open((dir + "/gpu_busy_percent").c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        s.gpu_busy_fd = fd;
+        s.gpu_dir = dir;
+      }
+    }
+  }
+  if (s.gpu_busy_fd < 0) return;
+  char buf[16];
+  const ssize_t n = ::pread(s.gpu_busy_fd, buf, sizeof(buf) - 1, 0);
+  if (n > 0) {
+    buf[n] = 0;
+    s.gpu_busy_sum += uint64_t(std::strtoul(buf, nullptr, 10));
+    ++s.gpu_busy_samples;
+  }
+}
+
+std::string CommandProcessor::HostPerfReport(double seconds) {
+  HostPerfState& s = HostPerf();
+  ProfEnsureTimers(s);
+  // Threads: CPU time since the last report, busiest first.
+  struct Busy {
+    double pct;
+    std::string name;
+  };
+  std::vector<Busy> busy;
+  std::unordered_map<int, uint64_t> ticks_now;
+  const double hz = double(::sysconf(_SC_CLK_TCK));
+  if (DIR* dir = ::opendir("/proc/self/task")) {
+    while (const dirent* e = ::readdir(dir)) {
+      const int tid = std::atoi(e->d_name);
+      if (tid <= 0) continue;
+      const std::string stat = ReadSmallFile(fmt::format("/proc/self/task/{}/stat", tid));
+      const size_t open = stat.find('('), close = stat.rfind(')');
+      if (open == std::string::npos || close == std::string::npos || close < open) continue;
+      // Fields after ") ": state(3) ... utime(14) stime(15).
+      uint64_t utime = 0, stime = 0;
+      int field = 3;
+      const char* p = stat.c_str() + close + 2;
+      while (*p && field <= 15) {
+        const char* end = std::strchr(p, ' ');
+        if (field == 14) utime = std::strtoull(p, nullptr, 10);
+        if (field == 15) stime = std::strtoull(p, nullptr, 10);
+        if (!end) break;
+        p = end + 1;
+        ++field;
+      }
+      const uint64_t ticks = utime + stime;
+      ticks_now[tid] = ticks;
+      const auto prev = s.prev_ticks.find(tid);
+      if (prev == s.prev_ticks.end() || ticks <= prev->second) continue;
+      const double pct = 100.0 * double(ticks - prev->second) / hz / seconds;
+      if (pct >= 1.0) busy.push_back({pct, stat.substr(open + 1, close - open - 1)});
+    }
+    ::closedir(dir);
+  }
+  const bool first = s.prev_ticks.empty();
+  s.prev_ticks = std::move(ticks_now);
+  std::string out;
+  if (first) {
+    out = "threads: (first sample)";
+  } else {
+    std::sort(busy.begin(), busy.end(), [](const Busy& a, const Busy& b) { return a.pct > b.pct; });
+    out = "threads % of a core:";
+    for (size_t i = 0; i < busy.size() && i < 10; ++i) {
+      out += fmt::format("{} {} {:.0f}", i ? " |" : "", busy[i].name, busy[i].pct);
+    }
+  }
+  // CPU clocks.
+  uint64_t khz_sum = 0, khz_max = 0, cpus = 0;
+  for (int cpu = 0; cpu < 64; ++cpu) {
+    const std::string v =
+        ReadSmallFile(fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", cpu));
+    if (v.empty()) {
+      if (cpu > 0) break;
+      continue;
+    }
+    const uint64_t khz = std::strtoull(v.c_str(), nullptr, 10);
+    khz_sum += khz;
+    khz_max = std::max(khz_max, khz);
+    ++cpus;
+  }
+  if (cpus) {
+    out += fmt::format("; CPU MHz avg {} max {}", khz_sum / cpus / 1000, khz_max / 1000);
+  }
+  // GPU utilisation (average of per-frame samples) and current shader clock.
+  if (s.gpu_busy_samples) {
+    out += fmt::format("; GPU busy {}%", s.gpu_busy_sum / s.gpu_busy_samples);
+    const std::string sclk = ReadSmallFile(s.gpu_dir + "/pp_dpm_sclk");
+    const size_t star = sclk.find('*');
+    if (star != std::string::npos) {
+      const size_t line_start = sclk.rfind('\n', star);
+      const size_t colon = sclk.find(':', line_start == std::string::npos ? 0 : line_start);
+      if (colon != std::string::npos && colon < star) {
+        out += fmt::format(" at {} MHz", std::strtoul(sclk.c_str() + colon + 1, nullptr, 10));
+      }
+    }
+  }
+  s.gpu_busy_sum = 0;
+  s.gpu_busy_samples = 0;
+  if (++s.prof_reports % 6 == 0) out += ProfReport(s);  // every 30 s
+  return out;
+}
+
+void CommandProcessor::HostPerfFileWrite(const std::string& fps_line, const std::string& host) {
+  HostPerfState& s = HostPerf();
+  if (!REXCVAR_GET(log_perf_file) || s.file_failed) return;
+  if (!s.file) {
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    std::string path = "perf_log.txt";
+    if (n > 0) {
+      exe[n] = 0;
+      std::string dir(exe);
+      dir.resize(dir.rfind('/') + 1);
+      path = dir + "perf_log.txt";
+    }
+    s.file = std::fopen(path.c_str(), "w");
+    if (!s.file) {
+      s.file_failed = true;
+      REXGPU_WARN("[host-perf] cannot write {}", path);
+      return;
+    }
+    const std::time_t t = std::time(nullptr);
+    char stamp[64];
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    std::fprintf(s.file,
+                 "Fable II performance log, started %s. One entry every 5 seconds: game frame "
+                 "rate, then CPU %% per thread (100 = one full core), CPU and GPU clocks.\n",
+                 stamp);
+  }
+  const std::time_t t = std::time(nullptr);
+  char stamp[16];
+  std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&t));
+  std::fprintf(s.file, "%s %s\n         %s\n", stamp, fps_line.c_str(), host.c_str());
+  std::fflush(s.file);
+}
+#else
+void CommandProcessor::HostPerfSampleFrame() {}
+std::string CommandProcessor::HostPerfReport(double) { return {}; }
+void CommandProcessor::HostPerfFileWrite(const std::string&, const std::string&) {}
+#endif
+
 void CommandProcessor::LogGuestFrameTiming() {
   using Clock = std::chrono::steady_clock;
   constexpr auto kWindow = std::chrono::seconds(5);
@@ -1090,6 +1526,7 @@ void CommandProcessor::LogGuestFrameTiming() {
   const Clock::duration frame = now - fps_log_last_swap_;
   fps_log_last_swap_ = now;
   ++fps_log_frames_;
+  HostPerfSampleFrame();
   fps_log_worst_ = std::max(fps_log_worst_, frame);
   if (frame > kSlowFrame) {
     ++fps_log_slow_frames_;
@@ -1102,6 +1539,7 @@ void CommandProcessor::LogGuestFrameTiming() {
   const uint64_t presents = presenter ? presenter->present_count() : 0;
   if (REXCVAR_GET(log_guest_fps)) {
     const double seconds = std::chrono::duration<double>(window).count();
+    const std::string host = HostPerfReport(seconds);
     static constexpr const char* kSyncNames[] = {"occlusion query", "memexport readback",
                                                  "resolve readback", "pipeline wait"};
     std::string syncs;
@@ -1112,12 +1550,18 @@ void CommandProcessor::LogGuestFrameTiming() {
                              std::chrono::duration<double, std::milli>(gpu_sync_time_[i]).count());
       }
     }
-    REXGPU_INFO("[guest-fps] {:.1f} fps over {:.1f} s, slowest frame {:.1f} ms, {} of {} "
-                "frames over 33 ms; host presented {:.1f}/s; GPU waits: {}",
-                fps_log_frames_ / seconds, seconds,
-                std::chrono::duration<double, std::milli>(fps_log_worst_).count(),
-                fps_log_slow_frames_, fps_log_frames_,
-                (presents - fps_log_presents_) / seconds, syncs.empty() ? "none" : syncs);
+    const std::string line = fmt::format(
+        "{:.1f} fps over {:.1f} s, slowest frame {:.1f} ms, {} of {} frames over 33 ms; host "
+        "presented {:.1f}/s; GPU waits: {}",
+        fps_log_frames_ / seconds, seconds,
+        std::chrono::duration<double, std::milli>(fps_log_worst_).count(), fps_log_slow_frames_,
+        fps_log_frames_, (presents - fps_log_presents_) / seconds,
+        syncs.empty() ? "none" : syncs);
+    REXGPU_INFO("[guest-fps] {}", line);
+    if (!host.empty()) {
+      REXGPU_INFO("[host-perf] {}", host);
+    }
+    HostPerfFileWrite(line, host);
   }
   fps_log_presents_ = presents;
   for (uint32_t i = 0; i < uint32_t(GpuSyncKind::kCount); ++i) {
