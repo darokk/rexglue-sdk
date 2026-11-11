@@ -15,10 +15,19 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+// Off by default: in Fable II it made distant scenery textures (a castle)
+// flicker every frame, so some changes to texture memory are only caught
+// because the widened invalidation around unrelated writes reloads them.
+REXCVAR_DEFINE_BOOL(shared_memory_spare_textures, false, "GPU",
+                    "When a CPU write invalidates the memory around it, stop at textures the "
+                    "write doesn't touch instead of reloading them too (experimental: misses "
+                    "texture changes that nothing else catches)");
 
 namespace rex::graphics {
 
@@ -541,6 +550,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   auto global_lock = global_critical_region_.Acquire();
 
   if (!exact_range) {
+    const uint32_t exact_page_first = page_first;
+    const uint32_t exact_page_last = page_last;
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
     // invalidated since it's not in sync with CPU memory and can't be
@@ -559,6 +570,28 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+    }
+    // Also stop the widening at watched ranges (textures) that the write
+    // itself doesn't touch. Widening is for buffer memory the CPU streams
+    // through, to take fewer access violations; spreading it over a
+    // neighboring texture only throws that texture away. In Fable II, writes
+    // near textures made about 60 unchanged textures reload every frame. Those
+    // pages stay protected, so a later write to one of them is still caught.
+    const uint32_t bucket_first = (page_first << page_size_log2_) >> kWatchBucketSizeLog2;
+    const uint32_t bucket_last = (page_last << page_size_log2_) >> kWatchBucketSizeLog2;
+    const bool spare_textures = REXCVAR_GET(shared_memory_spare_textures);
+    for (uint32_t bucket = bucket_first; spare_textures && bucket <= bucket_last; ++bucket) {
+      for (const WatchNode* node = watch_buckets_[bucket]; node; node = node->bucket_node_next) {
+        const WatchRange* range = node->range;
+        if (range->page_first <= exact_page_last && range->page_last >= exact_page_first) {
+          continue;  // Written to - invalidated anyway.
+        }
+        if (range->page_last < exact_page_first && range->page_last >= page_first) {
+          page_first = range->page_last + 1;
+        } else if (range->page_first > exact_page_last && range->page_first <= page_last) {
+          page_last = range->page_first - 1;
+        }
+      }
     }
   }
 

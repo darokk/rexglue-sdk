@@ -253,6 +253,7 @@ class CommandProcessor {
     kMemexportReadback,
     kResolveReadback,
     kPipelineWait,
+    kFrameSync,
     kCount,
   };
   void NoteGpuSync(GpuSyncKind kind, std::chrono::steady_clock::time_point started) {
@@ -294,6 +295,11 @@ class CommandProcessor {
   uint32_t fps_log_slow_frames_ = 0;
   std::chrono::steady_clock::duration fps_log_worst_{};
   uint64_t fps_log_presents_ = 0;
+  // g_frame_events totals at the previous swap, and what the slowest frame of
+  // the current window did (texture loads, KB uploaded, shader translations,
+  // pipelines created).
+  uint64_t fps_log_events_last_[4] = {};
+  uint64_t fps_log_worst_events_[4] = {};
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;

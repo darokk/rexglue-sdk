@@ -54,6 +54,13 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, gpu_sync_at_frame_start);
+REXCVAR_DEFINE_BOOL(vulkan_skip_unused_index_address, true, "GPU/Vulkan",
+                    "Don't re-upload the system constants for an index buffer address that the "
+                    "draw's vertex shader doesn't read");
+REXCVAR_DEFINE_BOOL(vulkan_reuse_texture_descriptor_sets, true, "GPU/Vulkan",
+                    "Reuse a texture descriptor set written earlier in the submission when a "
+                    "draw needs identical contents");
 REXCVAR_DEFINE_BOOL(readback_resolve_force_delayed, false, "GPU",
                     "Read back resolves forced by readback_resolve_force_addresses one resolve "
                     "late (double-buffered, like readback_resolve = fast) instead of waiting for "
@@ -634,17 +641,17 @@ bool SameImageInfo(const VkDescriptorImageInfo& a, const VkDescriptorImageInfo& 
 // contents.
 uint64_t HashImageInfos(VkDescriptorSetLayout layout, const VkDescriptorImageInfo* infos,
                         size_t count) {
-  auto mix = [](uint64_t h, uint64_t v) {
-    h ^= v + UINT64_C(0x9E3779B97F4A7C15) + (h << 6) + (h >> 2);
-    return h;
-  };
-  uint64_t h = mix(uint64_t(count), reinterpret_cast<uint64_t>(layout));
+  // A short multiply-xor step per descriptor (the handles are already well
+  // spread, and a collision only costs a compare).
+  uint64_t h = uint64_t(count) * UINT64_C(0x9E3779B97F4A7C15) ^ reinterpret_cast<uint64_t>(layout);
   for (size_t i = 0; i < count; ++i) {
-    h = mix(h, reinterpret_cast<uint64_t>(infos[i].sampler));
-    h = mix(h, reinterpret_cast<uint64_t>(infos[i].imageView));
-    h = mix(h, uint64_t(infos[i].imageLayout));
+    const uint64_t v = (reinterpret_cast<uint64_t>(infos[i].sampler) ^
+                        (reinterpret_cast<uint64_t>(infos[i].imageView) << 1) ^
+                        (uint64_t(infos[i].imageLayout) << 56)) *
+                       UINT64_C(0xC2B2AE3D27D4EB4F);
+    h = (h ^ v) * UINT64_C(0x165667B19E3779F9) + i;
   }
-  return h;
+  return h ^ (h >> 29);
 }
 }  // namespace
 
@@ -5298,6 +5305,16 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
+  if (is_opening_frame && REXCVAR_GET(gpu_sync_at_frame_start) && GetCurrentSubmission() > 1) {
+    // Wait for all earlier work, not just the frame kMaxFramesInFlight back:
+    // effects that read data the CPU rewrites every frame break when the GPU
+    // is still drawing older frames (as on D3D12, distant trees, the dog's
+    // texture and sun lighting flicker there).
+    await_submission = std::max(await_submission, GetCurrentSubmission() - 1);
+    const auto frame_sync_start = std::chrono::steady_clock::now();
+    CheckSubmissionFenceAndDeviceLoss(await_submission);
+    NoteGpuSync(GpuSyncKind::kFrameSync, frame_sync_start);
+  }
   CheckSubmissionFenceAndDeviceLoss(await_submission);
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
@@ -6249,9 +6266,18 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.flags != flags;
   system_constants_.flags = flags;
 
-  // Index buffer address for loading in the shaders.
-  if (flags & (SpirvShaderTranslator::kSysFlag_VertexIndexLoad |
-               SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad)) {
+  // Index buffer address for loading in the shaders. A plain vertex shader
+  // (no point or rectangle expansion) reads it only for kSysFlag_VertexIndexLoad
+  // - the host index buffer supplies its indices otherwise - so leave the old
+  // value there: with it changing on nearly every indexed draw, it alone kept
+  // the system constants from being reused between draws.
+  const bool index_load_address_read =
+      !REXCVAR_GET(vulkan_skip_unused_index_address) ||
+      (flags & SpirvShaderTranslator::kSysFlag_VertexIndexLoad) ||
+      ((flags & SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad) &&
+       primitive_processing_result.host_vertex_shader_type !=
+           Shader::HostVertexShaderType::kVertex);
+  if (index_load_address_read) {
     dirty |=
         system_constants_.vertex_index_load_address != primitive_processing_result.guest_index_base;
     system_constants_.vertex_index_load_address = primitive_processing_result.guest_index_base;
@@ -6857,10 +6883,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     return true;
   };
   uint64_t texture_set_hashes[2] = {};
+  const bool reuse_texture_sets = REXCVAR_GET(vulkan_reuse_texture_descriptor_sets);
   for (uint32_t i = 0; i < 2; ++i) {
     const uint32_t set_bit = UINT32_C(1) << texture_set_indices[i];
     const size_t begin = texture_set_image_info_ranges[i][0];
     const size_t count = texture_set_image_info_ranges[i][1] - begin;
+    if (!reuse_texture_sets) {
+      // Diagnostic fallback: a new set for every draw that uses textures.
+      current_graphics_descriptor_set_values_up_to_date_ &= ~set_bit;
+      continue;
+    }
     const TextureDescriptorSetCacheEntry* last = last_texture_descriptor_set_entries_[i];
     if (count && last && (current_graphics_descriptor_set_values_up_to_date_ & set_bit) &&
         last->set == current_graphics_descriptor_sets_[texture_set_indices[i]] &&

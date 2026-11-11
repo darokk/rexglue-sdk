@@ -34,6 +34,7 @@
 #include <rex/memory.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_events.h>
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -1244,6 +1245,7 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
 
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
+  CountFrameEvent(g_frame_events.shader_translations);
   if (!translator.TranslateAnalyzedShader(translation)) {
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
@@ -3486,6 +3488,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
+  if (!creating_placeholder) {
+    CountFrameEvent(g_frame_events.pipelines_created);
+  }
   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
   if (create_result != VK_SUCCESS) {

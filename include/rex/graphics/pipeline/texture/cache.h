@@ -604,6 +604,30 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // Direct-mapped memo in front of textures_ for FindOrCreateTexture, which
+  // runs whenever a texture binding changes (most draws). Cleared whenever a
+  // texture is destroyed.
+  struct TextureLookupMemoEntry {
+    TextureKey key;
+    Texture* texture = nullptr;
+  };
+  // A busy frame binds a few thousand different textures, so 256 entries
+  // mostly missed.
+  static constexpr uint32_t kTextureLookupMemoSizeLog2 = 12;
+  TextureLookupMemoEntry texture_lookup_memo_[1u << kTextureLookupMemoSizeLog2];
+  static uint32_t TextureLookupMemoIndex(const TextureKey& key) {
+    static_assert(sizeof(TextureKey) == 16, "TextureKey memo hash reads 16 bytes");
+    uint64_t words[2];
+    std::memcpy(words, &key, sizeof(words));
+    return uint32_t(((words[0] ^ (words[1] * UINT64_C(0xC2B2AE3D27D4EB4F))) *
+                     UINT64_C(0x9E3779B97F4A7C15)) >>
+                    (64 - kTextureLookupMemoSizeLog2));
+  }
+  void ClearTextureLookupMemo() {
+    for (TextureLookupMemoEntry& entry : texture_lookup_memo_) {
+      entry.texture = nullptr;
+    }
+  }
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

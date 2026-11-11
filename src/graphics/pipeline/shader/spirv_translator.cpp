@@ -33,6 +33,12 @@ REXCVAR_DEFINE_BOOL(spirv_clamp_relative_float_constants, true, "GPU/Shader",
                     "uniform buffer (an out-of-bounds read can hang AMD GPUs; the SPIR-V "
                     "counterpart of dxbc_clamp_relative_float_constants; applied at "
                     "translation, needs a restart)");
+REXCVAR_DEFINE_BOOL(spirv_wrap_relative_float_constants, false, "GPU/Shader",
+                    "With spirv_clamp_relative_float_constants, wrap relatively addressed float "
+                    "constant indices around the 256-entry array (index & 255) instead of "
+                    "clamping them to its ends. Equally safe; experimental test for effects that "
+                    "may treat the constants as a ring buffer (Fable II's trail). Needs a "
+                    "restart");
 
 namespace rex::graphics {
 
@@ -3508,7 +3514,10 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
     // (Fable II's trail effect, VS 87D12B6DEC03F597, hangs RDNA 3 and 4 this way
     // on D3D12). Clamp to the array, as the DXBC translator does.
     uint32_t float_constant_count = constant_register_map.float_count;
-    if (float_constant_count) {
+    if (float_constant_count == 256 && REXCVAR_GET(spirv_wrap_relative_float_constants)) {
+      index = builder_->createBinOp(spv::OpBitwiseAnd, type_int_, index,
+                                    builder_->makeIntConstant(255));
+    } else if (float_constant_count) {
       index = builder_->createTriBuiltinCall(type_int_, ext_inst_glsl_std_450_, GLSLstd450SClamp,
                                              index, const_int_0_,
                                              builder_->makeIntConstant(int(float_constant_count - 1)));

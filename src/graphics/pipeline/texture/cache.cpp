@@ -18,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_events.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -284,6 +285,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     }
     if (!destroyed_any) {
       destroyed_any = true;
+      ClearTextureLookupMemo();
       // The texture being destroyed might have been bound in the previous
       // submissions, and nothing has overwritten the binding yet, so completion
       // of the submission where the texture was last actually used on the GPU
@@ -439,6 +441,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
                                              pending_load.load_mips)) {
     return false;
   }
+  CountFrameEvent(g_frame_events.texture_loads);
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a
@@ -453,7 +456,10 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+  // Plain load first: the flag is rarely set, and the exchange is a locked
+  // instruction on every draw otherwise.
+  if (texture_became_outdated_.load(std::memory_order_relaxed) &&
+      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
@@ -757,6 +763,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  ClearTextureLookupMemo();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -859,8 +866,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Try to find an existing texture.
   // TODO(Triang3l): Reuse a texture with mip_page unchanged, but base_page
   // previously 0, now not 0, to save memory - common case in streaming.
+  TextureLookupMemoEntry& memo = texture_lookup_memo_[TextureLookupMemoIndex(key)];
+  if (memo.texture && memo.key == key) {
+    return memo.texture;
+  }
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
+    memo.key = key;
+    memo.texture = found_texture_it->second.get();
     return found_texture_it->second.get();
   }
 

@@ -324,6 +324,15 @@ if(REXGLUE_LTO)
     message(STATUS "ReXGlue LTO: ThinLTO for rexgpu-xenos")
 endif()
 
+# Line tables for the GPU plugin library, so the hot spot offsets that the
+# built-in profiler writes to perf_log.txt can be mapped to source lines
+# (llvm-symbolizer on the unstripped library). They don't change the generated
+# code, and packaging strips them.
+option(REXGLUE_GPU_LINE_TABLES "Line tables (-gline-tables-only) for the GPU plugin library" OFF)
+if(REXGLUE_GPU_LINE_TABLES AND NOT MSVC)
+    target_compile_options(rexgpu-xenos PRIVATE -gline-tables-only)
+endif()
+
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)
     enable_testing()

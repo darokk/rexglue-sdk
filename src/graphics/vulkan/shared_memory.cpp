@@ -16,6 +16,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/frame_events.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -374,6 +375,7 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      CountFrameEvent(g_frame_events.upload_bytes, upload_buffer_size);
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
