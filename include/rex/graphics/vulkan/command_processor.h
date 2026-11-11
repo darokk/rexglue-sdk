@@ -11,12 +11,16 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -147,12 +151,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
     assert_true(submission_open_);
-    return deferred_command_buffer_;
+    return *deferred_command_buffer_;
   }
   // Executed before deferred_command_buffer() in the same submission.
   DeferredCommandBuffer& upload_command_buffer() {
     assert_true(submission_open_);
-    return upload_command_buffer_;
+    return *upload_command_buffer_;
   }
 
   bool submission_open() const { return submission_open_; }
@@ -276,6 +280,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;
+    // Uploads, submitted before `buffer` (allocated from the same pool).
+    VkCommandBuffer upload_buffer;
   };
 
   struct SparseBufferBind {
@@ -570,8 +576,72 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
-  DeferredCommandBuffer deferred_command_buffer_;
-  DeferredCommandBuffer upload_command_buffer_;
+
+  // Submission worker (vulkan_async_submit). The command processor records
+  // each submission into a SubmitJob's deferred command buffers; the worker
+  // thread replays the published part into the job's Vulkan command buffer
+  // while recording continues (the driver's vkCmd* cost leaves the command
+  // processor thread), and submits it once the job is finalized. Submission
+  // numbering and all completion bookkeeping stay on the command processor
+  // thread; anything that waits for a submission first waits until the
+  // worker has submitted it (WaitForSubmitted).
+  struct SubmitJob {
+    SubmitJob(const VulkanCommandProcessor& command_processor)
+        : deferred(command_processor), upload(command_processor, 64 * 1024) {}
+    DeferredCommandBuffer deferred;
+    // Executed before `deferred`, in its own command buffer of the same
+    // submission (uploads may be added until the end of the submission).
+    DeferredCommandBuffer upload;
+    CommandBuffer command_buffer = {};
+    // Set before `finalized`.
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+    uint64_t submission = 0;
+    std::atomic<bool> finalized{false};
+    // Worker-side state.
+    bool recording = false;
+    DeferredCommandBuffer::Cursor cursor;
+  };
+  // Takes a free (or new) job with a writable command buffer and appends it to
+  // the queue; nullptr if the Vulkan objects couldn't be created.
+  SubmitJob* AcquireSubmitJob();
+  // Replays what's published, and if the job is finalized, everything and
+  // submits it. Returns whether the job was submitted (or failed for good).
+  bool ProcessSubmitJob(SubmitJob& job, bool wait_for_work);
+  void SubmitWorkerMain();
+  void StartSubmitWorker();
+  void StopSubmitWorker();
+  // Blocks until the worker has submitted `submission` (and every earlier one).
+  void WaitForSubmitted(uint64_t submission);
+  // Publishes the current job's recorded commands, waking the worker if it is
+  // waiting and enough has accumulated (or if `force`).
+  void PublishSubmitJob(bool force = false);
+  bool async_submit_ = false;
+  // The job of the open submission (owned by submit_queue_; the worker can't
+  // finish it before EndSubmission finalizes it).
+  SubmitJob* submit_job_current_ = nullptr;
+  std::mutex submit_mutex_;
+  std::condition_variable submit_cv_;
+  // Jobs not yet submitted, oldest first (the worker processes the front).
+  std::deque<std::unique_ptr<SubmitJob>> submit_queue_;
+  std::vector<std::unique_ptr<SubmitJob>> submit_jobs_free_;
+  static constexpr size_t kMaxQueuedSubmitJobs = 4;
+  std::atomic<bool> submit_worker_shutdown_{false};
+  std::thread submit_worker_;
+  // Highest submission the worker has passed to vkQueueSubmit.
+  std::atomic<uint64_t> submissions_submitted_{0};
+  std::atomic<bool> submit_worker_waiting_{false};
+  // Incremented (and notified) to wake the worker waiting for new commands or
+  // a finalized job.
+  std::atomic<uint32_t> submit_wake_seq_{0};
+  void WakeSubmitWorker();
+  std::atomic<bool> submit_device_lost_{false};
+  uint32_t submit_publishes_since_wake_ = 0;
+  // Commands recorded while no submission is open (discarded, as before).
+  std::unique_ptr<DeferredCommandBuffer> closed_command_buffer_;
+  DeferredCommandBuffer* deferred_command_buffer_ = nullptr;
+  DeferredCommandBuffer* upload_command_buffer_ = nullptr;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

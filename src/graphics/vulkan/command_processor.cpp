@@ -29,6 +29,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/thread.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -55,6 +56,11 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DECLARE(bool, gpu_sync_at_frame_start);
+REXCVAR_DEFINE_BOOL(vulkan_async_submit, true, "GPU/Vulkan",
+                    "Replay recorded GPU commands into Vulkan and submit them on a separate "
+                    "thread, so the driver's command recording cost leaves the GPU command "
+                    "processor thread. Needs a restart")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_skip_unused_index_address, true, "GPU/Vulkan",
                     "Don't re-upload the system constants for an index buffer address that the "
                     "draw's vertex shader doesn't read");
@@ -664,8 +670,6 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2
 VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_system,
                                                system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state),
-      deferred_command_buffer_(*this),
-      upload_command_buffer_(*this, 64 * 1024),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -684,9 +688,12 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           kDescriptorPoolSizeTextures, uint32_t(rex::countof(kDescriptorPoolSizeTextures)),
           kLinkedTypeDescriptorPoolSetCount) {
   legacy_readback_memexport_cvar_name_ = "vulkan_readback_memexport";
+  closed_command_buffer_ = std::make_unique<DeferredCommandBuffer>(*this, 64 * 1024);
+  deferred_command_buffer_ = closed_command_buffer_.get();
+  upload_command_buffer_ = closed_command_buffer_.get();
 }
 
-VulkanCommandProcessor::~VulkanCommandProcessor() = default;
+VulkanCommandProcessor::~VulkanCommandProcessor() { StopSubmitWorker(); }
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
@@ -1984,6 +1991,8 @@ bool VulkanCommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  StartSubmitWorker();
+
   return true;
 }
 
@@ -2148,8 +2157,18 @@ void VulkanCommandProcessor::ShutdownContext() {
   sparse_buffer_binds_.clear();
   sparse_memory_binds_.clear();
 
-  deferred_command_buffer_.Reset();
-  upload_command_buffer_.Reset();
+  StopSubmitWorker();
+  // Jobs never submitted (a submission left open): their command pools go
+  // with the writable ones.
+  for (const std::unique_ptr<SubmitJob>& job : submit_queue_) {
+    command_buffers_writable_.push_back(job->command_buffer);
+  }
+  submit_queue_.clear();
+  submit_job_current_ = nullptr;
+  submit_jobs_free_.clear();
+  deferred_command_buffer_ = closed_command_buffer_.get();
+  upload_command_buffer_ = closed_command_buffer_.get();
+  closed_command_buffer_->Reset();
   for (const auto& command_buffer_pair : command_buffers_submitted_) {
     dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
   }
@@ -2199,6 +2218,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   }
   current_submission_wait_semaphores_.clear();
   submission_completed_ = 0;
+  submissions_submitted_.store(0, std::memory_order_relaxed);
   submission_open_ = false;
 
   for (VkSemaphore semaphore : semaphores_free_) {
@@ -2691,7 +2711,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             gamma_ramp_buffer_copy.srcOffset = gamma_ramp_upload_offset;
             gamma_ramp_buffer_copy.dstOffset = gamma_ramp_offset_in_frame;
             gamma_ramp_buffer_copy.size = gamma_ramp_size;
-            deferred_command_buffer_.CmdVkCopyBuffer(gamma_ramp_upload_buffer_, gamma_ramp_buffer_,
+            deferred_command_buffer_->CmdVkCopyBuffer(gamma_ramp_upload_buffer_, gamma_ramp_buffer_,
                                                      1, &gamma_ramp_buffer_copy);
             PushBufferMemoryBarrier(gamma_ramp_buffer_, gamma_ramp_offset_in_frame, gamma_ramp_size,
                                     VK_PIPELINE_STAGE_TRANSFER_BIT, gamma_ramp_read_stage_mask,
@@ -2785,19 +2805,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               swap_descriptor_source;
           swap_apply_gamma_compute_descriptor_sets[kSwapApplyGammaComputeDescriptorSetDestination] =
               swap_descriptor_destination_storage;
-          deferred_command_buffer_.CmdVkBindDescriptorSets(
+          deferred_command_buffer_->CmdVkBindDescriptorSets(
               VK_PIPELINE_BIND_POINT_COMPUTE, swap_apply_gamma_compute_pipeline_layout_, 0,
               uint32_t(swap_apply_gamma_compute_descriptor_sets.size()),
               swap_apply_gamma_compute_descriptor_sets.data(), 0, nullptr);
           SwapApplyGammaConstants swap_apply_gamma_constants = {
               {guest_output_width, guest_output_height}};
-          deferred_command_buffer_.CmdVkPushConstants(
+          deferred_command_buffer_->CmdVkPushConstants(
               swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
               sizeof(swap_apply_gamma_constants), &swap_apply_gamma_constants);
           BindExternalComputePipeline(swap_apply_gamma_compute_pipeline);
           uint32_t group_count_x = (guest_output_width + 15) / 16;
           uint32_t group_count_y = (guest_output_height + 7) / 8;
-          deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          deferred_command_buffer_->CmdVkDispatch(group_count_x, group_count_y, 1);
 
           if (use_fxaa) {
             // Make the FXAA source image readable and bind a separate
@@ -2855,20 +2875,20 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetSource] = swap_descriptor_fxaa_source;
             swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetDestination] =
                 swap_descriptor_fxaa_destination_storage;
-            deferred_command_buffer_.CmdVkBindDescriptorSets(
+            deferred_command_buffer_->CmdVkBindDescriptorSets(
                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_fxaa_pipeline_layout_, 0,
                 uint32_t(swap_fxaa_descriptor_sets.size()), swap_fxaa_descriptor_sets.data(), 0,
                 nullptr);
             SwapFxaaConstants swap_fxaa_constants = {
                 {guest_output_width, guest_output_height},
                 {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)}};
-            deferred_command_buffer_.CmdVkPushConstants(
+            deferred_command_buffer_->CmdVkPushConstants(
                 swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(swap_fxaa_constants), &swap_fxaa_constants);
             BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            deferred_command_buffer_->CmdVkDispatch(group_count_x, group_count_y, 1);
           }
 
           // Insert the release barrier.
@@ -2974,7 +2994,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           render_pass_begin_info.renderArea.extent.height = guest_output_height;
           render_pass_begin_info.clearValueCount = 0;
           render_pass_begin_info.pClearValues = nullptr;
-          deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+          deferred_command_buffer_->CmdVkBeginRenderPass(&render_pass_begin_info,
                                                         VK_SUBPASS_CONTENTS_INLINE);
 
           VkViewport viewport;
@@ -3019,12 +3039,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               swap_descriptors_gamma_ramp_[2 * gamma_ramp_frame_index_ref +
                                            uint32_t(use_pwl_gamma_ramp)];
           swap_descriptor_sets[kSwapApplyGammaDescriptorSetSource] = swap_descriptor_source;
-          deferred_command_buffer_.CmdVkBindDescriptorSets(
+          deferred_command_buffer_->CmdVkBindDescriptorSets(
               VK_PIPELINE_BIND_POINT_GRAPHICS, swap_apply_gamma_pipeline_layout_, 0,
               uint32_t(swap_descriptor_sets.size()), swap_descriptor_sets.data(), 0, nullptr);
 
-          deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
-          deferred_command_buffer_.CmdVkEndRenderPass();
+          deferred_command_buffer_->CmdVkDraw(3, 1, 0, 0);
+          deferred_command_buffer_->CmdVkEndRenderPass();
 
           // Insert the release barrier.
           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
@@ -3186,7 +3206,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     // .data() + offset, not &[offset], for buffer and image barriers, because
     // if there are no buffer or image memory barriers in the last pipeline
     // barriers, the offsets may be equal to the sizes of the vectors.
-    deferred_command_buffer_.CmdVkPipelineBarrier(
+    deferred_command_buffer_->CmdVkPipelineBarrier(
         it->src_stage_mask ? it->src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         it->dst_stage_mask ? it->dst_stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
         nullptr,
@@ -3228,9 +3248,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   if (in_render_pass_) {
     if (use_dynamic_rendering) {
-      deferred_command_buffer_.CmdVkEndRendering();
+      deferred_command_buffer_->CmdVkEndRendering();
     } else {
-      deferred_command_buffer_.CmdVkEndRenderPass();
+      deferred_command_buffer_->CmdVkEndRenderPass();
     }
     in_render_pass_ = false;
   }
@@ -3261,7 +3281,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
     rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
-    deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+    deferred_command_buffer_->CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3275,7 +3295,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
-    deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+    deferred_command_buffer_->CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
@@ -3303,9 +3323,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   if (in_render_pass_) {
     if (use_dynamic_rendering) {
-      deferred_command_buffer_.CmdVkEndRendering();
+      deferred_command_buffer_->CmdVkEndRendering();
     } else {
-      deferred_command_buffer_.CmdVkEndRenderPass();
+      deferred_command_buffer_->CmdVkEndRenderPass();
     }
     in_render_pass_ = false;
   }
@@ -3356,7 +3376,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
-    deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+    deferred_command_buffer_->CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3368,7 +3388,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
-    deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+    deferred_command_buffer_->CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
@@ -3380,9 +3400,9 @@ void VulkanCommandProcessor::EndRenderPass() {
     return;
   }
   if (current_render_pass_ == VK_NULL_HANDLE) {
-    deferred_command_buffer_.CmdVkEndRendering();
+    deferred_command_buffer_->CmdVkEndRendering();
   } else {
-    deferred_command_buffer_.CmdVkEndRenderPass();
+    deferred_command_buffer_->CmdVkEndRenderPass();
   }
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
@@ -3652,7 +3672,7 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
   if (current_external_graphics_pipeline_ == pipeline) {
     return;
   }
-  deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  deferred_command_buffer_->CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   current_external_graphics_pipeline_ = pipeline;
   current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
@@ -3662,7 +3682,7 @@ void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
   if (current_external_compute_pipeline_ == pipeline) {
     return;
   }
-  deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+  deferred_command_buffer_->CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   current_external_compute_pipeline_ = pipeline;
 }
 
@@ -3677,7 +3697,7 @@ void VulkanCommandProcessor::SetViewport(const VkViewport& viewport) {
   }
   if (dynamic_viewport_update_needed_) {
     dynamic_viewport_ = viewport;
-    deferred_command_buffer_.CmdVkSetViewport(0, 1, &dynamic_viewport_);
+    deferred_command_buffer_->CmdVkSetViewport(0, 1, &dynamic_viewport_);
     dynamic_viewport_update_needed_ = false;
   }
 }
@@ -3691,7 +3711,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
   }
   if (dynamic_scissor_update_needed_) {
     dynamic_scissor_ = scissor;
-    deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
+    deferred_command_buffer_->CmdVkSetScissor(0, 1, &dynamic_scissor_);
     dynamic_scissor_update_needed_ = false;
   }
 }
@@ -3714,6 +3734,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  // Hand the draw's commands to the submission worker on every return path
+  // (a local class may use the member function's private names).
+  struct PublishOnReturn {
+    VulkanCommandProcessor& command_processor;
+    ~PublishOnReturn() { command_processor.PublishSubmitJob(); }
+  } publish_on_return{*this};
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -4014,7 +4040,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   if (current_guest_graphics_pipeline_ != pipeline) {
     ++work_stats_.pipeline_binds;
-    deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    deferred_command_buffer_->CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
   }
@@ -4223,7 +4249,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       guest_dma_index_copy_region.srcOffset = primitive_processing_result.guest_index_base;
       guest_dma_index_copy_region.dstOffset = 0;
       guest_dma_index_copy_region.size = guest_dma_index_size;
-      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
+      deferred_command_buffer_->CmdVkCopyBuffer(shared_memory_->buffer(),
                                                guest_dma_index_scratch_buffer.buffer(), 1,
                                                &guest_dma_index_copy_region);
       PushBufferMemoryBarrier(
@@ -4264,7 +4290,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    deferred_command_buffer_->CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
@@ -4290,12 +4316,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
         return draw_fail("unexpected_index_buffer_type");
     }
-    deferred_command_buffer_.CmdVkBindIndexBuffer(
+    deferred_command_buffer_->CmdVkBindIndexBuffer(
         index_buffer.first, index_buffer.second,
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+    deferred_command_buffer_->CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
 
@@ -4360,7 +4386,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
     readback_region.srcOffset = memexport_range.base_address_dwords << 2;
     readback_region.dstOffset = readback_offset;
     readback_region.size = memexport_range.size_bytes;
-    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
+    deferred_command_buffer_->CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
                                              &readback_region);
     readback_offset += memexport_range.size_bytes;
   }
@@ -4506,7 +4532,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     readback_region.srcOffset = memexport_range.base_address_dwords << 2;
     readback_region.dstOffset = readback_offset;
     readback_region.size = memexport_range.size_bytes;
-    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
+    deferred_command_buffer_->CmdVkCopyBuffer(shared_memory_->buffer(),
                                              readback.buffers[write_index], 1, &readback_region);
     readback_offset += memexport_range.size_bytes;
   }
@@ -4565,6 +4591,10 @@ bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  struct PublishOnReturn {
+    VulkanCommandProcessor& command_processor;
+    ~PublishOnReturn() { command_processor.PublishSubmitJob(); }
+  } publish_on_return{*this};
 
   if (!BeginSubmission(true)) {
     return false;
@@ -4772,7 +4802,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     pre_barrier.buffer = resolve_downscale_buffer_;
     pre_barrier.offset = 0;
     pre_barrier.size = written_length;
-    deferred_command_buffer_.CmdVkPipelineBarrier(
+    deferred_command_buffer_->CmdVkPipelineBarrier(
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
 
@@ -4788,13 +4818,13 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                                    (constants.scale_x > 1 || constants.scale_y > 1))
                                       ? 1u
                                       : 0u;
-    deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
+    deferred_command_buffer_->CmdVkPushConstants(resolve_downscale_pipeline_layout_,
                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                                                 &constants);
-    deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+    deferred_command_buffer_->CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                                      resolve_downscale_pipeline_layout_, 0, 1,
                                                      &descriptor_set, 0, nullptr);
-    deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+    deferred_command_buffer_->CmdVkDispatch(tile_count, 1, 1);
 
     VkBufferMemoryBarrier downscale_barrier = {};
     downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -4805,7 +4835,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     downscale_barrier.buffer = resolve_downscale_buffer_;
     downscale_barrier.offset = 0;
     downscale_barrier.size = written_length;
-    deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    deferred_command_buffer_->CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
                                                   &downscale_barrier, 0, nullptr);
 
@@ -4813,7 +4843,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     readback_region.srcOffset = 0;
     readback_region.dstOffset = 0;
     readback_region.size = written_length;
-    deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_,
+    deferred_command_buffer_->CmdVkCopyBuffer(resolve_downscale_buffer_,
                                              readback.buffers[write_index], 1, &readback_region);
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
@@ -4823,7 +4853,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     readback_region.srcOffset = written_address;
     readback_region.dstOffset = 0;
     readback_region.size = written_length;
-    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
+    deferred_command_buffer_->CmdVkCopyBuffer(shared_memory_->buffer(),
                                              readback.buffers[write_index], 1, &readback_region);
   }
 
@@ -5010,7 +5040,7 @@ bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out
 void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
     if (BeginSubmission(true)) {
-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
+      deferred_command_buffer_->CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
       EndSubmission(false);
     }
@@ -5156,7 +5186,23 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  size_t fences_total = submissions_in_flight_fences_.size();
+  // The submission worker may not have passed the latest submissions to
+  // vkQueueSubmit yet: wait for the awaited one, and only check the fences of
+  // the submitted ones.
+  if (await_submission > submission_completed_) {
+    WaitForSubmitted(await_submission);
+  }
+  if (submit_device_lost_.load(std::memory_order_acquire)) {
+    device_lost_ = true;
+    if (graphics_system_) {
+      graphics_system_->OnHostGpuLossFromAnyThread(true);
+    }
+    return;
+  }
+  size_t fences_total =
+      std::min(submissions_in_flight_fences_.size(),
+               size_t(submissions_submitted_.load(std::memory_order_acquire) -
+                      submission_completed_));
   size_t fences_awaited = 0;
   if (await_submission > submission_completed_) {
     // Await in a blocking way if requested.
@@ -5337,11 +5383,17 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     submission_open_ = true;
     ++work_stats_.submissions;
 
-    // Start a new deferred command buffer - will submit it to the real one in
-    // the end of the submission (when async pipeline object creation requests
-    // are fulfilled).
-    deferred_command_buffer_.Reset();
-    upload_command_buffer_.Reset();
+    // Start new deferred command buffers - the submission worker replays them
+    // into a real one while recording continues, and submits it in the end of
+    // the submission (when async pipeline object creation requests are
+    // fulfilled).
+    submit_job_current_ = AcquireSubmitJob();
+    if (!submit_job_current_) {
+      submission_open_ = false;
+      return false;
+    }
+    deferred_command_buffer_ = &submit_job_current_->deferred;
+    upload_command_buffer_ = &submit_job_current_->upload;
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -5473,32 +5525,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       }
       semaphores_free_.push_back(semaphore);
     }
-    if (command_buffers_writable_.empty()) {
-      CommandBuffer command_buffer;
-      VkCommandPoolCreateInfo command_pool_create_info;
-      command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-      command_pool_create_info.pNext = nullptr;
-      command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-      command_pool_create_info.queueFamilyIndex = vulkan_device->queue_family_graphics_compute();
-      if (dfn.vkCreateCommandPool(device, &command_pool_create_info, nullptr,
-                                  &command_buffer.pool) != VK_SUCCESS) {
-        REXGPU_ERROR("Failed to create a Vulkan command pool");
-        return false;
-      }
-      VkCommandBufferAllocateInfo command_buffer_allocate_info;
-      command_buffer_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-      command_buffer_allocate_info.pNext = nullptr;
-      command_buffer_allocate_info.commandPool = command_buffer.pool;
-      command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-      command_buffer_allocate_info.commandBufferCount = 1;
-      if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info,
-                                       &command_buffer.buffer) != VK_SUCCESS) {
-        REXGPU_ERROR("Failed to allocate a Vulkan command buffer");
-        dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
-        return false;
-      }
-      command_buffers_writable_.push_back(command_buffer);
-    }
   }
 
   bool is_closing_frame = is_swap && frame_open_;
@@ -5513,7 +5539,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     assert_false(scratch_buffer_used_);
 
     if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
+      deferred_command_buffer_->CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
       active_occlusion_query_ = {};
     }
@@ -5580,79 +5606,64 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     SubmitBarriers(true);
 
-    assert_false(command_buffers_writable_.empty());
-    CommandBuffer command_buffer = command_buffers_writable_.back();
-    if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to reset a Vulkan command pool");
-      return false;
-    }
-    VkCommandBufferBeginInfo command_buffer_begin_info;
-    command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    command_buffer_begin_info.pNext = nullptr;
-    command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    command_buffer_begin_info.pInheritanceInfo = nullptr;
-    if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to begin a Vulkan command buffer");
-      return false;
-    }
-    upload_command_buffer_.Execute(command_buffer.buffer);
-    deferred_command_buffer_.Execute(command_buffer.buffer);
-    if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to end a Vulkan command buffer");
-      return false;
-    }
-
-    VkSubmitInfo submit_info;
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.pNext = nullptr;
-    if (!current_submission_wait_semaphores_.empty()) {
-      submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
-      submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
-      submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
-    } else {
-      submit_info.waitSemaphoreCount = 0;
-      submit_info.pWaitSemaphores = nullptr;
-      submit_info.pWaitDstStageMask = nullptr;
-    }
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &command_buffer.buffer;
-    submit_info.signalSemaphoreCount = 0;
-    submit_info.pSignalSemaphores = nullptr;
     assert_false(fences_free_.empty());
     VkFence fence = fences_free_.back();
     if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to reset a Vulkan submission fence");
       return false;
     }
-    VkResult submit_result;
-    {
-      ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
-          vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
-      submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
-    }
-    if (submit_result != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to submit a Vulkan command buffer");
-      if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
-        device_lost_ = true;
-        if (graphics_system_) {
-          graphics_system_->OnHostGpuLossFromAnyThread(true);
-        }
-      }
-      return false;
-    }
+
+    // Hand the submission to the worker: it replays the rest of the recorded
+    // commands, records the uploads, and submits with this fence. The
+    // submission gets its number (and all the completion bookkeeping) here.
+    SubmitJob& job = *submit_job_current_;
     uint64_t submission_current = GetCurrentSubmission();
+    job.fence = fence;
+    job.wait_semaphores = current_submission_wait_semaphores_;
+    job.wait_stage_masks = current_submission_wait_stage_masks_;
+    job.submission = submission_current;
+    job.deferred.Publish();
+    job.upload.Publish();
+    job.finalized.store(true, std::memory_order_seq_cst);
     current_submission_wait_stage_masks_.clear();
     for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
       submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
     }
     current_submission_wait_semaphores_.clear();
-    command_buffers_submitted_.emplace_back(submission_current, command_buffer);
-    command_buffers_writable_.pop_back();
+    command_buffers_submitted_.emplace_back(submission_current, job.command_buffer);
     // Increments the current submission number, going to the next submission.
     submissions_in_flight_fences_.push_back(fence);
     fences_free_.pop_back();
 
+    submit_job_current_ = nullptr;
+    deferred_command_buffer_ = closed_command_buffer_.get();
+    upload_command_buffer_ = closed_command_buffer_.get();
+    closed_command_buffer_->Reset();
     submission_open_ = false;
+
+    if (async_submit_) {
+      // Wake the worker for the finalized job.
+      WakeSubmitWorker();
+      // The presenter puts its own commands for the guest output after these
+      // in the queue right after a swap submission, so it must be submitted
+      // before returning.
+      if (is_swap) {
+        WaitForSubmitted(submission_current);
+      }
+    } else {
+      // Synchronous: replay and submit here, as before.
+      ProcessSubmitJob(job, false);
+      std::lock_guard<std::mutex> lock(submit_mutex_);
+      assert_true(!submit_queue_.empty() && submit_queue_.front().get() == &job);
+      submit_jobs_free_.push_back(std::move(submit_queue_.front()));
+      submit_queue_.pop_front();
+    }
+    if (submit_device_lost_.load(std::memory_order_acquire) && !device_lost_) {
+      device_lost_ = true;
+      if (graphics_system_) {
+        graphics_system_->OnHostGpuLossFromAnyThread(true);
+      }
+    }
   }
 
   if (is_closing_frame) {
@@ -5697,6 +5708,270 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   }
 
   return true;
+}
+
+VulkanCommandProcessor::SubmitJob* VulkanCommandProcessor::AcquireSubmitJob() {
+  std::unique_ptr<SubmitJob> job;
+  {
+    std::unique_lock<std::mutex> lock(submit_mutex_);
+    // Bound how far recording may run ahead of the worker. The queued jobs
+    // are all finalized (only one submission is open at a time), so the
+    // worker makes progress.
+    submit_cv_.wait(lock, [this]() { return submit_queue_.size() < kMaxQueuedSubmitJobs; });
+    if (!submit_jobs_free_.empty()) {
+      job = std::move(submit_jobs_free_.back());
+      submit_jobs_free_.pop_back();
+    }
+  }
+  if (!job) {
+    job = std::make_unique<SubmitJob>(*this);
+  }
+  job->deferred.Reset();
+  job->upload.Reset();
+  job->fence = VK_NULL_HANDLE;
+  job->wait_semaphores.clear();
+  job->wait_stage_masks.clear();
+  job->submission = 0;
+  job->finalized.store(false, std::memory_order_relaxed);
+  job->recording = false;
+  job->cursor = {};
+
+  if (command_buffers_writable_.empty()) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    CommandBuffer command_buffer;
+    VkCommandPoolCreateInfo command_pool_create_info;
+    command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    command_pool_create_info.pNext = nullptr;
+    command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    command_pool_create_info.queueFamilyIndex = vulkan_device->queue_family_graphics_compute();
+    if (dfn.vkCreateCommandPool(device, &command_pool_create_info, nullptr,
+                                &command_buffer.pool) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create a Vulkan command pool");
+      std::lock_guard<std::mutex> lock(submit_mutex_);
+      submit_jobs_free_.push_back(std::move(job));
+      return nullptr;
+    }
+    VkCommandBufferAllocateInfo command_buffer_allocate_info;
+    command_buffer_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_buffer_allocate_info.pNext = nullptr;
+    command_buffer_allocate_info.commandPool = command_buffer.pool;
+    command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_buffer_allocate_info.commandBufferCount = 2;
+    VkCommandBuffer buffers[2];
+    if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info, buffers) !=
+        VK_SUCCESS) {
+      REXGPU_ERROR("Failed to allocate Vulkan command buffers");
+      dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
+      std::lock_guard<std::mutex> lock(submit_mutex_);
+      submit_jobs_free_.push_back(std::move(job));
+      return nullptr;
+    }
+    command_buffer.buffer = buffers[0];
+    command_buffer.upload_buffer = buffers[1];
+    command_buffers_writable_.push_back(command_buffer);
+  }
+  job->command_buffer = command_buffers_writable_.back();
+  command_buffers_writable_.pop_back();
+
+  SubmitJob* job_raw = job.get();
+  {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    submit_queue_.push_back(std::move(job));
+  }
+  submit_cv_.notify_all();
+  return job_raw;
+}
+
+void VulkanCommandProcessor::WakeSubmitWorker() {
+  submit_publishes_since_wake_ = 0;
+  submit_wake_seq_.fetch_add(1, std::memory_order_seq_cst);
+  submit_wake_seq_.notify_all();
+}
+
+void VulkanCommandProcessor::PublishSubmitJob(bool force) {
+  if (!submit_job_current_) {
+    return;
+  }
+  submit_job_current_->deferred.Publish();
+  if (!async_submit_) {
+    return;
+  }
+  // A futex wake costs about a microsecond, and the worker replays a draw in
+  // a fraction of the time the command processor takes to record one, so
+  // only wake a waiting worker once a batch of draws has accumulated.
+  constexpr uint32_t kPublishesPerWake = 64;
+  if ((force || ++submit_publishes_since_wake_ >= kPublishesPerWake) &&
+      submit_worker_waiting_.load(std::memory_order_seq_cst)) {
+    WakeSubmitWorker();
+  }
+}
+
+bool VulkanCommandProcessor::ProcessSubmitJob(SubmitJob& job, bool wait_for_work) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  bool failed = false;
+  auto fail = [&](const char* message) {
+    REXGPU_ERROR("Vulkan submission worker: {}", message);
+    failed = true;
+  };
+
+  if (!job.recording) {
+    job.recording = true;
+    VkCommandBufferBeginInfo begin_info;
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.pNext = nullptr;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    begin_info.pInheritanceInfo = nullptr;
+    if (dfn.vkResetCommandPool(device, job.command_buffer.pool, 0) != VK_SUCCESS) {
+      fail("failed to reset a command pool");
+    } else if (dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &begin_info) != VK_SUCCESS) {
+      fail("failed to begin a command buffer");
+    }
+  }
+
+  // Replay while recording continues, until the job is finalized and fully
+  // replayed. `finalized` is stored after the final Publish, so once it's seen
+  // set, everything recorded is visible.
+  while (true) {
+    const uint32_t wake_seq = submit_wake_seq_.load(std::memory_order_seq_cst);
+    const bool finalized = job.finalized.load(std::memory_order_acquire);
+    if (!failed) {
+      job.deferred.ExecutePublished(job.command_buffer.buffer, job.cursor);
+    }
+    if (finalized) {
+      if (failed || !job.deferred.HasUnexecutedPublished(job.cursor)) {
+        break;
+      }
+      continue;
+    }
+    if (!wait_for_work || submit_worker_shutdown_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    submit_worker_waiting_.store(true, std::memory_order_seq_cst);
+    if (!job.deferred.HasUnexecutedPublished(job.cursor) &&
+        !job.finalized.load(std::memory_order_seq_cst) &&
+        !submit_worker_shutdown_.load(std::memory_order_seq_cst)) {
+      submit_wake_seq_.wait(wake_seq, std::memory_order_seq_cst);
+    }
+    submit_worker_waiting_.store(false, std::memory_order_relaxed);
+  }
+
+  VkCommandBuffer submit_buffers[2];
+  uint32_t submit_buffer_count = 0;
+  if (!failed && dfn.vkEndCommandBuffer(job.command_buffer.buffer) != VK_SUCCESS) {
+    fail("failed to end a command buffer");
+  }
+  if (!failed && !job.upload.empty()) {
+    VkCommandBufferBeginInfo begin_info;
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.pNext = nullptr;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    begin_info.pInheritanceInfo = nullptr;
+    if (dfn.vkBeginCommandBuffer(job.command_buffer.upload_buffer, &begin_info) != VK_SUCCESS) {
+      fail("failed to begin an upload command buffer");
+    } else {
+      job.upload.Execute(job.command_buffer.upload_buffer);
+      if (dfn.vkEndCommandBuffer(job.command_buffer.upload_buffer) != VK_SUCCESS) {
+        fail("failed to end an upload command buffer");
+      } else {
+        // The uploads come first in submission order.
+        submit_buffers[submit_buffer_count++] = job.command_buffer.upload_buffer;
+      }
+    }
+  }
+  submit_buffers[submit_buffer_count++] = job.command_buffer.buffer;
+
+  VkSubmitInfo submit_info;
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.pNext = nullptr;
+  submit_info.waitSemaphoreCount = uint32_t(job.wait_semaphores.size());
+  submit_info.pWaitSemaphores = job.wait_semaphores.empty() ? nullptr : job.wait_semaphores.data();
+  submit_info.pWaitDstStageMask =
+      job.wait_stage_masks.empty() ? nullptr : job.wait_stage_masks.data();
+  submit_info.commandBufferCount = failed ? 0 : submit_buffer_count;
+  submit_info.pCommandBuffers = failed ? nullptr : submit_buffers;
+  submit_info.signalSemaphoreCount = 0;
+  submit_info.pSignalSemaphores = nullptr;
+  VkResult submit_result;
+  {
+    ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+        vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+    // On a failure above, still submit (without the commands) so the fence
+    // and the wait semaphores are consumed and nothing waits forever.
+    submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, job.fence);
+  }
+  if (submit_result != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+    // Without the submission the fence would never be signaled; treat it like
+    // a lost device so nothing waits on it forever.
+    submit_device_lost_.store(true, std::memory_order_release);
+  }
+  submissions_submitted_.store(job.submission, std::memory_order_release);
+  submissions_submitted_.notify_all();
+  return true;
+}
+
+void VulkanCommandProcessor::SubmitWorkerMain() {
+  rex::thread::set_current_thread_name("GPU Submit");
+  while (true) {
+    SubmitJob* job;
+    {
+      std::unique_lock<std::mutex> lock(submit_mutex_);
+      submit_cv_.wait(lock, [this]() {
+        return submit_worker_shutdown_.load(std::memory_order_relaxed) || !submit_queue_.empty();
+      });
+      if (submit_worker_shutdown_.load(std::memory_order_relaxed)) {
+        return;
+      }
+      job = submit_queue_.front().get();
+    }
+    if (!ProcessSubmitJob(*job, true)) {
+      // Only returns early when shutting down.
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(submit_mutex_);
+      submit_jobs_free_.push_back(std::move(submit_queue_.front()));
+      submit_queue_.pop_front();
+    }
+    submit_cv_.notify_all();
+  }
+}
+
+void VulkanCommandProcessor::StartSubmitWorker() {
+  async_submit_ = REXCVAR_GET(vulkan_async_submit);
+  if (!async_submit_ || submit_worker_.joinable()) {
+    return;
+  }
+  submit_worker_shutdown_.store(false, std::memory_order_relaxed);
+  submit_worker_ = std::thread([this]() { SubmitWorkerMain(); });
+  REXGPU_INFO("Vulkan submission worker started");
+}
+
+void VulkanCommandProcessor::StopSubmitWorker() {
+  if (!submit_worker_.joinable()) {
+    async_submit_ = false;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    submit_worker_shutdown_.store(true, std::memory_order_seq_cst);
+  }
+  submit_cv_.notify_all();
+  WakeSubmitWorker();
+  submit_worker_.join();
+  async_submit_ = false;
+}
+
+void VulkanCommandProcessor::WaitForSubmitted(uint64_t submission) {
+  uint64_t submitted = submissions_submitted_.load(std::memory_order_acquire);
+  while (submitted < submission) {
+    submissions_submitted_.wait(submitted, std::memory_order_acquire);
+    submitted = submissions_submitted_.load(std::memory_order_acquire);
+  }
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
@@ -5946,7 +6221,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     if (dynamic_depth_bias_update_needed_) {
       dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
       dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
-      deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
+      deferred_command_buffer_->CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
                                                  dynamic_depth_bias_slope_factor_);
       dynamic_depth_bias_update_needed_ = false;
     }
@@ -5962,7 +6237,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
         std::memcmp(dynamic_blend_constants_, blend_constants, sizeof(float) * 4) != 0;
     if (dynamic_blend_constants_update_needed_) {
       std::memcpy(dynamic_blend_constants_, blend_constants, sizeof(float) * 4);
-      deferred_command_buffer_.CmdVkSetBlendConstants(dynamic_blend_constants_);
+      deferred_command_buffer_->CmdVkSetBlendConstants(dynamic_blend_constants_);
       dynamic_blend_constants_update_needed_ = false;
     }
 
@@ -6020,15 +6295,15 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     if (dynamic_stencil_compare_mask_front_update_needed_ ||
         dynamic_stencil_compare_mask_back_update_needed_) {
       if (dynamic_stencil_compare_mask_front_ == dynamic_stencil_compare_mask_back_) {
-        deferred_command_buffer_.CmdVkSetStencilCompareMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+        deferred_command_buffer_->CmdVkSetStencilCompareMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                             dynamic_stencil_compare_mask_front_);
       } else {
         if (dynamic_stencil_compare_mask_front_update_needed_) {
-          deferred_command_buffer_.CmdVkSetStencilCompareMask(VK_STENCIL_FACE_FRONT_BIT,
+          deferred_command_buffer_->CmdVkSetStencilCompareMask(VK_STENCIL_FACE_FRONT_BIT,
                                                               dynamic_stencil_compare_mask_front_);
         }
         if (dynamic_stencil_compare_mask_back_update_needed_) {
-          deferred_command_buffer_.CmdVkSetStencilCompareMask(VK_STENCIL_FACE_BACK_BIT,
+          deferred_command_buffer_->CmdVkSetStencilCompareMask(VK_STENCIL_FACE_BACK_BIT,
                                                               dynamic_stencil_compare_mask_back_);
         }
       }
@@ -6038,15 +6313,15 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     if (dynamic_stencil_write_mask_front_update_needed_ ||
         dynamic_stencil_write_mask_back_update_needed_) {
       if (dynamic_stencil_write_mask_front_ == dynamic_stencil_write_mask_back_) {
-        deferred_command_buffer_.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+        deferred_command_buffer_->CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                           dynamic_stencil_write_mask_front_);
       } else {
         if (dynamic_stencil_write_mask_front_update_needed_) {
-          deferred_command_buffer_.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_BIT,
+          deferred_command_buffer_->CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_BIT,
                                                             dynamic_stencil_write_mask_front_);
         }
         if (dynamic_stencil_write_mask_back_update_needed_) {
-          deferred_command_buffer_.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_BACK_BIT,
+          deferred_command_buffer_->CmdVkSetStencilWriteMask(VK_STENCIL_FACE_BACK_BIT,
                                                             dynamic_stencil_write_mask_back_);
         }
       }
@@ -6056,15 +6331,15 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     if (dynamic_stencil_reference_front_update_needed_ ||
         dynamic_stencil_reference_back_update_needed_) {
       if (dynamic_stencil_reference_front_ == dynamic_stencil_reference_back_) {
-        deferred_command_buffer_.CmdVkSetStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+        deferred_command_buffer_->CmdVkSetStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                           dynamic_stencil_reference_front_);
       } else {
         if (dynamic_stencil_reference_front_update_needed_) {
-          deferred_command_buffer_.CmdVkSetStencilReference(VK_STENCIL_FACE_FRONT_BIT,
+          deferred_command_buffer_->CmdVkSetStencilReference(VK_STENCIL_FACE_FRONT_BIT,
                                                             dynamic_stencil_reference_front_);
         }
         if (dynamic_stencil_reference_back_update_needed_) {
-          deferred_command_buffer_.CmdVkSetStencilReference(VK_STENCIL_FACE_BACK_BIT,
+          deferred_command_buffer_->CmdVkSetStencilReference(VK_STENCIL_FACE_BACK_BIT,
                                                             dynamic_stencil_reference_back_);
         }
       }
@@ -7070,7 +7345,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     const bool binds_constants =
         descriptor_set_index <= SpirvShaderTranslator::kDescriptorSetConstants &&
         descriptor_set_mask_tzcnt > SpirvShaderTranslator::kDescriptorSetConstants;
-    deferred_command_buffer_.CmdVkBindDescriptorSets(
+    deferred_command_buffer_->CmdVkBindDescriptorSets(
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), descriptor_set_index,
         descriptor_set_mask_tzcnt - descriptor_set_index,
