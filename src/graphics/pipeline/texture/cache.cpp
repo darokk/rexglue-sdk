@@ -437,11 +437,46 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                             pending_load.load_mips)) {
-    return false;
+  // Skip reloading data that is unchanged since the last load: the texture
+  // was invalidated, but the guest data it was loaded from is the same (a CPU
+  // write invalidates the 256 KB around it, and with it unrelated textures).
+  // Known from the shared memory content fingerprints, which the upload just
+  // refreshed; only available for data uploaded from guest memory, never for
+  // GPU-written data or scaled resolves.
+  bool load_base = pending_load.load_base;
+  bool load_mips = pending_load.load_mips;
+  uint64_t base_hash = 0, mips_hash = 0;
+  if (!texture_key.scaled_resolve) {
+    if (load_base &&
+        shared_memory().GetRangeContentHash(texture_key.base_page << 12,
+                                            uint32_t(texture.GetGuestBaseSize()), base_hash) &&
+        base_hash == texture.base_content_hash_) {
+      load_base = false;
+    }
+    if (load_mips &&
+        shared_memory().GetRangeContentHash(texture_key.mip_page << 12,
+                                            uint32_t(texture.GetGuestMipsSize()), mips_hash) &&
+        mips_hash == texture.mips_content_hash_) {
+      load_mips = false;
+    }
   }
-  CountFrameEvent(g_frame_events.texture_loads);
+  if (load_base || load_mips) {
+    if (!LoadTextureDataFromResidentMemoryImpl(texture, load_base, load_mips)) {
+      // Unknown what the texture holds now.
+      texture.base_content_hash_ = 0;
+      texture.mips_content_hash_ = 0;
+      return false;
+    }
+    CountFrameEvent(g_frame_events.texture_loads);
+    if (load_base) {
+      texture.base_content_hash_ = base_hash;
+    }
+    if (load_mips) {
+      texture.mips_content_hash_ = mips_hash;
+    }
+  } else {
+    CountFrameEvent(g_frame_events.texture_loads_skipped);
+  }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a

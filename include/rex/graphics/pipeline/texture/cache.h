@@ -238,6 +238,12 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // Shared memory content fingerprints of the base and mip data the texture
+    // was last loaded from (0 = unknown). A reload of data whose fingerprint is
+    // unchanged is skipped. Command processor thread only.
+    uint64_t base_content_hash_ = 0;
+    uint64_t mips_content_hash_ = 0;
+
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
     explicit Texture(TextureCache& texture_cache, const TextureKey& key, bool track_usage = true);

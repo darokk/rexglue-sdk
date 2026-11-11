@@ -95,6 +95,16 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Content fingerprints of the pages in the GPU buffer (command processor
+  // thread only). A page's fingerprint is the hash of the guest data last
+  // uploaded to it, or 0 when unknown (never uploaded through the hashing
+  // path, or written by the GPU since). An upload of a page whose guest data
+  // still matches its fingerprint only needs to make the page valid again: the
+  // GPU copy is already up to date.
+  // Combined fingerprint of the pages covering [start, start + length), false
+  // if any of them is unknown.
+  bool GetRangeContentHash(uint32_t start, uint32_t length, uint64_t& hash_out) const;
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
@@ -128,6 +138,12 @@ class SharedMemory {
 
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
+  // After MakeRangeValid for a range whose data could not be uploaded: makes
+  // the next request upload it (the protection stays; the content
+  // fingerprints are cleared).
+  void InvalidateRangeForReupload(uint32_t start, uint32_t length);
+  // The content fingerprint of a page, for uploads to compare and refresh.
+  uint64_t& page_content_hash(uint32_t page) { return page_content_hashes_[page]; }
 
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
@@ -173,6 +189,10 @@ class SharedMemory {
   // ***************************************************************************
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
+
+  // Per-page content fingerprints (see GetRangeContentHash). Not protected by
+  // the global critical region: only the command processor thread uses them.
+  std::vector<uint64_t> page_content_hashes_;
 
   // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;

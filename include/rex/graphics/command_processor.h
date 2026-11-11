@@ -174,6 +174,9 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // GPU execution time of the submissions completed since the last call, in
+  // nanoseconds, or UINT64_MAX if the backend doesn't measure it.
+  virtual uint64_t TakeGpuTimeNs() { return UINT64_MAX; }
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

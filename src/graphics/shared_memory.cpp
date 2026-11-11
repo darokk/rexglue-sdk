@@ -18,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/hash.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
@@ -43,6 +44,7 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  page_content_hashes_.assign(size_t(kBufferSize >> page_size_log2_), 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -95,7 +97,52 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_.shrink_to_fit();
   system_page_flags_valid_and_gpu_written_.clear();
   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
+  page_content_hashes_.clear();
+  page_content_hashes_.shrink_to_fit();
   num_system_page_flags_ = 0;
+}
+
+void SharedMemory::InvalidateRangeForReupload(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  if (!page_content_hashes_.empty()) {
+    std::fill(page_content_hashes_.begin() + page_first,
+              page_content_hashes_.begin() + page_last + 1, uint64_t(0));
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t i = page_first >> 6; i <= page_last >> 6; ++i) {
+    uint64_t bits = UINT64_MAX;
+    if (i == page_first >> 6) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == page_last >> 6 && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    system_page_flags_valid_[i] &= ~bits;
+    system_page_flags_valid_and_gpu_written_[i] &= ~bits;
+  }
+}
+
+bool SharedMemory::GetRangeContentHash(uint32_t start, uint32_t length,
+                                       uint64_t& hash_out) const {
+  if (!length || start >= kBufferSize || page_content_hashes_.empty()) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    if (!page_content_hashes_[page]) {
+      return false;
+    }
+  }
+  hash_out = XXH3_64bits(page_content_hashes_.data() + page_first,
+                         sizeof(uint64_t) * (page_last - page_first + 1));
+  return true;
 }
 
 void SharedMemory::InvalidateAllPages() {
@@ -300,6 +347,12 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_page_last = last >> page_size_log2_;
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
+
+  if (written_by_gpu && !page_content_hashes_.empty()) {
+    // The GPU copy no longer holds the data last uploaded.
+    std::fill(page_content_hashes_.begin() + valid_page_first,
+              page_content_hashes_.begin() + valid_page_last + 1, uint64_t(0));
+  }
 
   {
     auto global_lock = global_critical_region_.Acquire();

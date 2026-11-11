@@ -20,9 +20,15 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_BOOL(shared_memory_skip_unchanged_uploads, true, "GPU/Vulkan",
+                    "When guest memory is uploaded to the GPU again, compare each page with a "
+                    "hash of what was last uploaded and skip the copy for unchanged pages (and "
+                    "the reload of textures whose pages are all unchanged)");
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
@@ -360,24 +366,25 @@ bool VulkanSharedMemory::UploadRanges(
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
-  for (auto upload_range : upload_page_ranges) {
-    uint32_t upload_range_start = upload_range.first;
-    uint32_t upload_range_length = upload_range.second;
-    while (upload_range_length) {
+  const uint32_t page_size = uint32_t(1) << page_size_log2();
+  const bool skip_unchanged = REXCVAR_GET(shared_memory_skip_unchanged_uploads);
+  // Copies [run_start, run_start + run_length) pages to the GPU buffer.
+  auto copy_run = [&](uint32_t run_start, uint32_t run_length) -> bool {
+    while (run_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
       uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
-          submission_current, upload_range_length << page_size_log2(),
-          size_t(1) << page_size_log2(), upload_buffer, upload_buffer_offset, upload_buffer_size);
+          submission_current, run_length << page_size_log2(), page_size, upload_buffer,
+          upload_buffer_offset, upload_buffer_size);
       if (upload_buffer_mapping == nullptr) {
         REXGPU_ERROR("Shared memory: Failed to get a Vulkan upload buffer");
-        successful = false;
-        break;
+        // Not copied: make them be requested again.
+        InvalidateRangeForReupload(run_start << page_size_log2(),
+                                   run_length << page_size_log2());
+        return false;
       }
-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
       CountFrameEvent(g_frame_events.upload_bytes, upload_buffer_size);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
+      std::memcpy(upload_buffer_mapping, memory().TranslatePhysical(run_start << page_size_log2()),
                   upload_buffer_size);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
@@ -388,11 +395,51 @@ bool VulkanSharedMemory::UploadRanges(
       upload_buffer_previous = upload_buffer;
       VkBufferCopy& upload_region = upload_regions_.emplace_back();
       upload_region.srcOffset = upload_buffer_offset;
-      upload_region.dstOffset = VkDeviceSize(upload_range_start << page_size_log2());
+      upload_region.dstOffset = VkDeviceSize(run_start << page_size_log2());
       upload_region.size = upload_buffer_size;
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
-      upload_range_start += upload_buffer_pages;
-      upload_range_length -= upload_buffer_pages;
+      run_start += upload_buffer_pages;
+      run_length -= upload_buffer_pages;
+    }
+    return true;
+  };
+  for (auto upload_range : upload_page_ranges) {
+    const uint32_t range_start = upload_range.first;
+    const uint32_t range_end = upload_range.first + upload_range.second;
+    // Protect (and mark valid) first, then read the guest data: a write after
+    // this point is caught by the protection and invalidates the pages again.
+    MakeRangeValid(range_start << page_size_log2(), upload_range.second << page_size_log2(),
+                   false);
+    // Copy only the pages whose guest data differs from what the GPU copy was
+    // last uploaded with (unchanged pages are common: a CPU write invalidates
+    // the 256 KB around it, and with it unrelated pages and textures).
+    uint32_t run_start = range_start;
+    for (uint32_t page = range_start; page < range_end; ++page) {
+      uint64_t& page_hash = page_content_hash(page);
+      bool changed = true;
+      if (skip_unchanged) {
+        uint64_t hash =
+            XXH3_64bits(memory().TranslatePhysical(page << page_size_log2()), page_size);
+        hash = hash ? hash : 1;
+        changed = hash != page_hash;
+        page_hash = hash;
+      } else {
+        page_hash = 0;
+      }
+      if (!changed) {
+        CountFrameEvent(g_frame_events.upload_bytes_skipped, page_size);
+        if (page > run_start && !copy_run(run_start, page - run_start)) {
+          // The rest of the range was marked valid but isn't processed.
+          InvalidateRangeForReupload(page << page_size_log2(),
+                                     (range_end - page) << page_size_log2());
+          successful = false;
+          break;
+        }
+        run_start = page + 1;
+      }
+    }
+    if (successful && range_end > run_start && !copy_run(run_start, range_end - run_start)) {
+      successful = false;
     }
     if (!successful) {
       break;

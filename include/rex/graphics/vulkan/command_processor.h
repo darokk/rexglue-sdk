@@ -265,6 +265,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  uint64_t TakeGpuTimeNs() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -598,6 +599,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkSemaphore> wait_semaphores;
     std::vector<VkPipelineStageFlags> wait_stage_masks;
     uint64_t submission = 0;
+    // Pair of timestamp queries (start, end) in gpu_timestamp_pool_, or
+    // UINT32_MAX without GPU timing.
+    uint32_t timestamp_slot = UINT32_MAX;
     std::atomic<bool> finalized{false};
     // Worker-side state.
     bool recording = false;
@@ -638,6 +642,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   void WakeSubmitWorker();
   std::atomic<bool> submit_device_lost_{false};
   uint32_t submit_publishes_since_wake_ = 0;
+  // GPU timing for the performance log: the time between timestamps at the
+  // start and the end of each submission's command buffer, summed up as the
+  // submissions complete.
+  static constexpr uint32_t kGpuTimestampSlots = 128;
+  VkQueryPool gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  uint32_t gpu_timestamp_slot_next_ = 0;
+  // <Submission, slot> of submitted ones whose time isn't read yet.
+  std::deque<std::pair<uint64_t, uint32_t>> gpu_timestamp_pending_;
+  uint64_t gpu_time_ns_ = 0;
   // Commands recorded while no submission is open (discarded, as before).
   std::unique_ptr<DeferredCommandBuffer> closed_command_buffer_;
   DeferredCommandBuffer* deferred_command_buffer_ = nullptr;

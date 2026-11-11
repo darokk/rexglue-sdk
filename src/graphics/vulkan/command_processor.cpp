@@ -1991,6 +1991,18 @@ bool VulkanCommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  // GPU timing for the performance log (failure only disables it).
+  if (vulkan_device->properties().timestampComputeAndGraphics) {
+    VkQueryPoolCreateInfo query_pool_create_info = {};
+    query_pool_create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    query_pool_create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    query_pool_create_info.queryCount = 2 * kGpuTimestampSlots;
+    if (dfn.vkCreateQueryPool(device, &query_pool_create_info, nullptr, &gpu_timestamp_pool_) !=
+        VK_SUCCESS) {
+      gpu_timestamp_pool_ = VK_NULL_HANDLE;
+    }
+  }
+
   StartSubmitWorker();
 
   return true;
@@ -2166,6 +2178,8 @@ void VulkanCommandProcessor::ShutdownContext() {
   submit_queue_.clear();
   submit_job_current_ = nullptr;
   submit_jobs_free_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device, gpu_timestamp_pool_);
+  gpu_timestamp_pending_.clear();
   deferred_command_buffer_ = closed_command_buffer_.get();
   upload_command_buffer_ = closed_command_buffer_.get();
   closed_command_buffer_->Reset();
@@ -5256,6 +5270,21 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
 
+  // Add up the GPU time of the completed submissions.
+  while (!gpu_timestamp_pending_.empty() &&
+         gpu_timestamp_pending_.front().first <= submission_completed_) {
+    uint64_t timestamps[2];
+    if (dfn.vkGetQueryPoolResults(device, gpu_timestamp_pool_,
+                                  gpu_timestamp_pending_.front().second * 2, 2, sizeof(timestamps),
+                                  timestamps, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        timestamps[1] >= timestamps[0]) {
+      gpu_time_ns_ += uint64_t(double(timestamps[1] - timestamps[0]) *
+                               double(vulkan_device->properties().timestampPeriod));
+    }
+    gpu_timestamp_pending_.pop_front();
+  }
+
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
     const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
@@ -5631,6 +5660,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     current_submission_wait_semaphores_.clear();
     command_buffers_submitted_.emplace_back(submission_current, job.command_buffer);
+    if (job.timestamp_slot != UINT32_MAX) {
+      gpu_timestamp_pending_.emplace_back(submission_current, job.timestamp_slot);
+    }
     // Increments the current submission number, going to the next submission.
     submissions_in_flight_fences_.push_back(fence);
     fences_free_.pop_back();
@@ -5735,6 +5767,11 @@ VulkanCommandProcessor::SubmitJob* VulkanCommandProcessor::AcquireSubmitJob() {
   job->finalized.store(false, std::memory_order_relaxed);
   job->recording = false;
   job->cursor = {};
+  job->timestamp_slot = UINT32_MAX;
+  if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+    job->timestamp_slot = gpu_timestamp_slot_next_;
+    gpu_timestamp_slot_next_ = (gpu_timestamp_slot_next_ + 1) % kGpuTimestampSlots;
+  }
 
   if (command_buffers_writable_.empty()) {
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -5784,6 +5821,15 @@ VulkanCommandProcessor::SubmitJob* VulkanCommandProcessor::AcquireSubmitJob() {
   return job_raw;
 }
 
+uint64_t VulkanCommandProcessor::TakeGpuTimeNs() {
+  if (gpu_timestamp_pool_ == VK_NULL_HANDLE) {
+    return UINT64_MAX;
+  }
+  uint64_t gpu_time_ns = gpu_time_ns_;
+  gpu_time_ns_ = 0;
+  return gpu_time_ns;
+}
+
 void VulkanCommandProcessor::WakeSubmitWorker() {
   submit_publishes_since_wake_ = 0;
   submit_wake_seq_.fetch_add(1, std::memory_order_seq_cst);
@@ -5829,6 +5875,11 @@ bool VulkanCommandProcessor::ProcessSubmitJob(SubmitJob& job, bool wait_for_work
       fail("failed to reset a command pool");
     } else if (dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &begin_info) != VK_SUCCESS) {
       fail("failed to begin a command buffer");
+    } else if (job.timestamp_slot != UINT32_MAX) {
+      dfn.vkCmdResetQueryPool(job.command_buffer.buffer, gpu_timestamp_pool_,
+                              job.timestamp_slot * 2, 2);
+      dfn.vkCmdWriteTimestamp(job.command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              gpu_timestamp_pool_, job.timestamp_slot * 2);
     }
   }
 
@@ -5861,6 +5912,10 @@ bool VulkanCommandProcessor::ProcessSubmitJob(SubmitJob& job, bool wait_for_work
 
   VkCommandBuffer submit_buffers[2];
   uint32_t submit_buffer_count = 0;
+  if (!failed && job.timestamp_slot != UINT32_MAX) {
+    dfn.vkCmdWriteTimestamp(job.command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            gpu_timestamp_pool_, job.timestamp_slot * 2 + 1);
+  }
   if (!failed && dfn.vkEndCommandBuffer(job.command_buffer.buffer) != VK_SUCCESS) {
     fail("failed to end a command buffer");
   }

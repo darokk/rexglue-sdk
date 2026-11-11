@@ -1292,6 +1292,8 @@ struct HostPerfState {
   rex::memory::ProtectStats protect_reported = {};
   uint64_t texture_loads_reported = 0;
   uint64_t upload_bytes_reported = 0;
+  uint64_t texture_loads_skipped_reported = 0;
+  uint64_t upload_bytes_skipped_reported = 0;
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1588,11 +1590,15 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
   const rex::memory::ProtectStats protect = rex::memory::GetProtectStats();
   const uint64_t texture_loads = g_frame_events.texture_loads.load(std::memory_order_relaxed);
   const uint64_t upload_bytes = g_frame_events.upload_bytes.load(std::memory_order_relaxed);
+  const uint64_t texture_loads_skipped =
+      g_frame_events.texture_loads_skipped.load(std::memory_order_relaxed);
+  const uint64_t upload_bytes_skipped =
+      g_frame_events.upload_bytes_skipped.load(std::memory_order_relaxed);
   out += fmt::format(
       "\n         per frame: {} draws, {} packets, {} pipeline binds, {} render passes, "
       "{:.1f} submissions | texture sets {} written {} reused, constant sets {}, set binds {} | "
       "uploads sys {} vs {} ps {} bool {} fetch {} | mprotect {} ({} KB), watch faults {} | "
-      "texture loads {}, {} KB uploaded",
+      "texture loads {} (+{} unchanged, skipped), {} KB uploaded (+{} KB unchanged, skipped)",
       per_frame(w.draws, p.draws), per_frame(w.packets, p.packets),
       per_frame(w.pipeline_binds, p.pipeline_binds), per_frame(w.render_passes, p.render_passes),
       double(w.submissions - p.submissions) / frames,
@@ -1609,11 +1615,15 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       per_frame(protect.protect_bytes, s.protect_reported.protect_bytes) / 1024,
       per_frame(protect.watch_faults, s.protect_reported.watch_faults),
       per_frame(texture_loads, s.texture_loads_reported),
-      per_frame(upload_bytes, s.upload_bytes_reported) / 1024);
+      per_frame(texture_loads_skipped, s.texture_loads_skipped_reported),
+      per_frame(upload_bytes, s.upload_bytes_reported) / 1024,
+      per_frame(upload_bytes_skipped, s.upload_bytes_skipped_reported) / 1024);
   work_stats_reported_ = work_stats_;
   s.protect_reported = protect;
   s.texture_loads_reported = texture_loads;
   s.upload_bytes_reported = upload_bytes;
+  s.texture_loads_skipped_reported = texture_loads_skipped;
+  s.upload_bytes_skipped_reported = upload_bytes_skipped;
 
   if (++s.prof_reports % 6 == 0) {  // every 30 s
     out += ProfReport(s);
@@ -1720,15 +1730,23 @@ void CommandProcessor::LogGuestFrameTiming() {
                              std::chrono::duration<double, std::milli>(gpu_sync_time_[i]).count());
       }
     }
+    // GPU execution time per guest frame (the GPU is the limit when this is
+    // close to the frame time).
+    const uint64_t gpu_time_ns = TakeGpuTimeNs();
+    std::string gpu_time;
+    if (gpu_time_ns != UINT64_MAX && fps_log_frames_) {
+      gpu_time = fmt::format("; GPU work {:.1f} ms per frame",
+                             double(gpu_time_ns) / 1e6 / double(fps_log_frames_));
+    }
     const std::string line = fmt::format(
         "{:.1f} fps over {:.1f} s, slowest frame {:.1f} ms ({} texture loads, {} KB uploaded, "
         "{} shaders translated, {} pipelines created), {} of {} frames over 33 ms; host "
-        "presented {:.1f}/s; GPU waits: {}",
+        "presented {:.1f}/s{}; GPU waits: {}",
         fps_log_frames_ / seconds, seconds,
         std::chrono::duration<double, std::milli>(fps_log_worst_).count(),
         fps_log_worst_events_[0], fps_log_worst_events_[1] / 1024, fps_log_worst_events_[2],
         fps_log_worst_events_[3], fps_log_slow_frames_, fps_log_frames_,
-        (presents - fps_log_presents_) / seconds, syncs.empty() ? "none" : syncs);
+        (presents - fps_log_presents_) / seconds, gpu_time, syncs.empty() ? "none" : syncs);
     REXGPU_INFO("[guest-fps] {}", line);
     if (!host.empty()) {
       REXGPU_INFO("[host-perf] {}", host);

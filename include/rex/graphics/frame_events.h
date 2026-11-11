@@ -13,6 +13,9 @@ namespace rex::graphics {
 struct FrameEvents {
   std::atomic<uint64_t> texture_loads{0};
   std::atomic<uint64_t> upload_bytes{0};  // guest memory copied to the GPU buffer
+  // Reuploads skipped because the data was unchanged (content fingerprints).
+  std::atomic<uint64_t> texture_loads_skipped{0};
+  std::atomic<uint64_t> upload_bytes_skipped{0};
   std::atomic<uint64_t> shader_translations{0};
   std::atomic<uint64_t> pipelines_created{0};
 };
