@@ -1996,11 +1996,13 @@ bool VulkanCommandProcessor::SetupContext() {
     VkQueryPoolCreateInfo query_pool_create_info = {};
     query_pool_create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     query_pool_create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    query_pool_create_info.queryCount = 2 * kGpuTimestampSlots;
+    query_pool_create_info.queryCount = kGpuTimestampSlots * kGpuTimestampsPerSlot;
     if (dfn.vkCreateQueryPool(device, &query_pool_create_info, nullptr, &gpu_timestamp_pool_) !=
         VK_SUCCESS) {
       gpu_timestamp_pool_ = VK_NULL_HANDLE;
     }
+    gpu_timestamp_categories_.assign(size_t(kGpuTimestampSlots) * kGpuTimestampsPerSlot, 0);
+    gpu_timestamp_counts_.assign(kGpuTimestampSlots, 0);
   }
 
   StartSubmitWorker();
@@ -2425,6 +2427,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  SetGpuTimeCategory(kGpuTimeOther);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3754,6 +3757,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     VulkanCommandProcessor& command_processor;
     ~PublishOnReturn() { command_processor.PublishSubmitJob(); }
   } publish_on_return{*this};
+  SetGpuTimeCategory(kGpuTimeDraw);
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -4001,16 +4005,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  SetGpuTimeCategory(kGpuTimeTextureLoad);
   texture_cache_->RequestTextures(used_texture_mask);
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
+  SetGpuTimeCategory(kGpuTimeRenderTarget);
   render_target_cache_->SetDepthOverwrittenByNextUpdate(
       fable2::ShouldSkipDepthTransfers(regs, *memory_, *vertex_shader));
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
+    SetGpuTimeCategory(kGpuTimeDraw);
     return draw_fail("render_target_update");
   }
+  SetGpuTimeCategory(kGpuTimeDraw);
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
@@ -4292,6 +4300,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
+
+  // The draw itself, for the GPU time breakdown.
+  SetGpuTimeCategory(primitive_processing_result.IsTessellated() ? kGpuTimeTessellation
+                     : memexport_writes_possible                  ? kGpuTimeMemexport
+                                                                  : kGpuTimeDraw);
 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
@@ -4609,6 +4622,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     VulkanCommandProcessor& command_processor;
     ~PublishOnReturn() { command_processor.PublishSubmitJob(); }
   } publish_on_return{*this};
+  SetGpuTimeCategory(kGpuTimeResolve);
 
   if (!BeginSubmission(true)) {
     return false;
@@ -5270,19 +5284,29 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
 
-  // Add up the GPU time of the completed submissions.
+  // Add up the GPU time of the completed submissions, per category.
   while (!gpu_timestamp_pending_.empty() &&
          gpu_timestamp_pending_.front().first <= submission_completed_) {
-    uint64_t timestamps[2];
-    if (dfn.vkGetQueryPoolResults(device, gpu_timestamp_pool_,
-                                  gpu_timestamp_pending_.front().second * 2, 2, sizeof(timestamps),
-                                  timestamps, sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-        timestamps[1] >= timestamps[0]) {
-      gpu_time_ns_ += uint64_t(double(timestamps[1] - timestamps[0]) *
-                               double(vulkan_device->properties().timestampPeriod));
-    }
+    const uint32_t slot = gpu_timestamp_pending_.front().second;
     gpu_timestamp_pending_.pop_front();
+    const uint32_t count = gpu_timestamp_counts_[slot];
+    if (count < 2) {
+      continue;
+    }
+    uint64_t timestamps[kGpuTimestampsPerSlot];
+    if (dfn.vkGetQueryPoolResults(device, gpu_timestamp_pool_, slot * kGpuTimestampsPerSlot, count,
+                                  sizeof(uint64_t) * count, timestamps, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+      continue;
+    }
+    const double period = double(vulkan_device->properties().timestampPeriod);
+    const uint8_t* categories = gpu_timestamp_categories_.data() + size_t(slot) * kGpuTimestampsPerSlot;
+    for (uint32_t i = 0; i + 1 < count; ++i) {
+      if (timestamps[i + 1] >= timestamps[i] && categories[i] < kGpuTimeCategoryCount) {
+        gpu_category_ns_[categories[i]] +=
+            uint64_t(double(timestamps[i + 1] - timestamps[i]) * period);
+      }
+    }
   }
 
   // Reclaim semaphores.
@@ -5423,6 +5447,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     deferred_command_buffer_ = &submit_job_current_->deferred;
     upload_command_buffer_ = &submit_job_current_->upload;
+    if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+      deferred_command_buffer_->SetTimestampCategory(gpu_time_category_);
+    }
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -5821,13 +5848,26 @@ VulkanCommandProcessor::SubmitJob* VulkanCommandProcessor::AcquireSubmitJob() {
   return job_raw;
 }
 
-uint64_t VulkanCommandProcessor::TakeGpuTimeNs() {
-  if (gpu_timestamp_pool_ == VK_NULL_HANDLE) {
-    return UINT64_MAX;
+std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
+  if (gpu_timestamp_pool_ == VK_NULL_HANDLE || !frames) {
+    return {};
   }
-  uint64_t gpu_time_ns = gpu_time_ns_;
-  gpu_time_ns_ = 0;
-  return gpu_time_ns;
+  static constexpr const char* kCategoryNames[kGpuTimeCategoryCount] = {
+      "other", "draws", "tessellated draws", "memexport draws", "render target copies",
+      "resolves", "texture loads", "uploads"};
+  uint64_t total_ns = 0;
+  for (uint64_t ns : gpu_category_ns_) {
+    total_ns += ns;
+  }
+  auto ms_per_frame = [frames](uint64_t ns) { return double(ns) / 1e6 / double(frames); };
+  std::string report = fmt::format("; GPU work {:.1f} ms per frame (", ms_per_frame(total_ns));
+  for (uint32_t i = 0; i < kGpuTimeCategoryCount; ++i) {
+    report += fmt::format("{}{} {:.1f}", i ? ", " : "", kCategoryNames[i],
+                          ms_per_frame(gpu_category_ns_[i]));
+    gpu_category_ns_[i] = 0;
+  }
+  report += ")";
+  return report;
 }
 
 void VulkanCommandProcessor::WakeSubmitWorker() {
@@ -5877,10 +5917,43 @@ bool VulkanCommandProcessor::ProcessSubmitJob(SubmitJob& job, bool wait_for_work
       fail("failed to begin a command buffer");
     } else if (job.timestamp_slot != UINT32_MAX) {
       dfn.vkCmdResetQueryPool(job.command_buffer.buffer, gpu_timestamp_pool_,
-                              job.timestamp_slot * 2, 2);
-      dfn.vkCmdWriteTimestamp(job.command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                              gpu_timestamp_pool_, job.timestamp_slot * 2);
+                              job.timestamp_slot * kGpuTimestampsPerSlot, kGpuTimestampsPerSlot);
+      gpu_timestamp_counts_[job.timestamp_slot] = 0;
     }
+  }
+
+  // Turns the category markers into timestamps in the job's slot (the first
+  // one at the start of the command buffer, the last one at the end).
+  struct TimestampSink : DeferredCommandBuffer::TimestampSink {
+    VulkanCommandProcessor& command_processor;
+    uint32_t slot;
+    explicit TimestampSink(VulkanCommandProcessor& command_processor, uint32_t slot)
+        : command_processor(command_processor), slot(slot) {}
+    void WriteTimestamp(VkCommandBuffer command_buffer, uint32_t category) override {
+      uint32_t& count = command_processor.gpu_timestamp_counts_[slot];
+      // Keep the last one for the end.
+      if (count >= kGpuTimestampsPerSlot - 1 && category != kGpuTimeCategoryCount) {
+        return;
+      }
+      if (count >= kGpuTimestampsPerSlot) {
+        return;
+      }
+      command_processor.gpu_timestamp_categories_[size_t(slot) * kGpuTimestampsPerSlot + count] =
+          uint8_t(category);
+      command_processor.GetVulkanDevice()->functions().vkCmdWriteTimestamp(
+          command_buffer,
+          count ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          command_processor.gpu_timestamp_pool_, slot * kGpuTimestampsPerSlot + count);
+      ++count;
+    }
+  };
+  TimestampSink timestamp_sink(*this, job.timestamp_slot);
+  const bool timestamps = !failed && job.timestamp_slot != UINT32_MAX;
+  if (timestamps) {
+    if (!gpu_timestamp_counts_[job.timestamp_slot]) {
+      timestamp_sink.WriteTimestamp(job.command_buffer.buffer, kGpuTimeOther);
+    }
+    job.deferred.set_timestamp_sink(&timestamp_sink);
   }
 
   // Replay while recording continues, until the job is finalized and fully
@@ -5899,6 +5972,7 @@ bool VulkanCommandProcessor::ProcessSubmitJob(SubmitJob& job, bool wait_for_work
       continue;
     }
     if (!wait_for_work || submit_worker_shutdown_.load(std::memory_order_acquire)) {
+      job.deferred.set_timestamp_sink(nullptr);
       return false;
     }
     submit_worker_waiting_.store(true, std::memory_order_seq_cst);
@@ -5912,9 +5986,10 @@ bool VulkanCommandProcessor::ProcessSubmitJob(SubmitJob& job, bool wait_for_work
 
   VkCommandBuffer submit_buffers[2];
   uint32_t submit_buffer_count = 0;
-  if (!failed && job.timestamp_slot != UINT32_MAX) {
-    dfn.vkCmdWriteTimestamp(job.command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            gpu_timestamp_pool_, job.timestamp_slot * 2 + 1);
+  job.deferred.set_timestamp_sink(nullptr);
+  if (timestamps && !failed) {
+    // The end (its category ends the last interval).
+    timestamp_sink.WriteTimestamp(job.command_buffer.buffer, kGpuTimeCategoryCount);
   }
   if (!failed && dfn.vkEndCommandBuffer(job.command_buffer.buffer) != VK_SUCCESS) {
     fail("failed to end a command buffer");

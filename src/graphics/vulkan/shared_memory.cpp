@@ -316,6 +316,16 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  // GPU time breakdown: the copies (and their barriers) are uploads.
+  struct UploadCategory {
+    VulkanCommandProcessor& command_processor;
+    uint32_t previous;
+    explicit UploadCategory(VulkanCommandProcessor& command_processor)
+        : command_processor(command_processor), previous(command_processor.gpu_time_category()) {
+      command_processor.SetGpuTimeCategory(VulkanCommandProcessor::kGpuTimeUpload);
+    }
+    ~UploadCategory() { command_processor.SetGpuTimeCategory(previous); }
+  } upload_category(command_processor_);
   // Pages that no command in the current submission has accessed yet can be
   // uploaded before all of them, in the upload command buffer, without ending
   // the render pass. Pages already accessed (rewritten by the guest between

@@ -379,8 +379,20 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + header_size, viewports, sizeof(VkViewport) * viewport_count);
   }
 
+  // GPU time breakdown: commands are tagged with a category, and a marker is
+  // recorded before the first command of a different category. The executing
+  // thread turns markers into timestamps through the sink (no sink: ignored).
+  class TimestampSink {
+   public:
+    virtual void WriteTimestamp(VkCommandBuffer command_buffer, uint32_t category) = 0;
+  };
+  static constexpr uint32_t kNoTimestampCategory = UINT32_MAX;
+  void SetTimestampCategory(uint32_t category) { timestamp_category_ = category; }
+  void set_timestamp_sink(TimestampSink* sink) { timestamp_sink_ = sink; }
+
  private:
   enum class Command {
+    kTimestampMarker,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -417,6 +429,10 @@ class DeferredCommandBuffer {
   };
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+
+  struct ArgsTimestampMarker {
+    uint32_t category;
+  };
 
   struct ArgsVkBeginRenderPass {
     VkRenderPass render_pass;
@@ -626,6 +642,12 @@ class DeferredCommandBuffer {
   size_t block_end_[kMaxBlocks] = {};
   uint32_t write_block_ = 0;
   size_t write_offset_ = 0;
+  // Category of the commands being recorded, and the one of the last marker.
+  uint32_t timestamp_category_ = kNoTimestampCategory;
+  uint32_t timestamp_category_marked_ = kNoTimestampCategory;
+  // Set by the executing thread for the duration of an execution.
+  TimestampSink* timestamp_sink_ = nullptr;
+  void* WriteCommandRaw(Command command, size_t arguments_size_bytes);
   // (block << kPublishedBlockShift) | offset of the published end.
   std::atomic<uint64_t> published_{0};
 };

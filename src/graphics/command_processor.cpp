@@ -1732,12 +1732,7 @@ void CommandProcessor::LogGuestFrameTiming() {
     }
     // GPU execution time per guest frame (the GPU is the limit when this is
     // close to the frame time).
-    const uint64_t gpu_time_ns = TakeGpuTimeNs();
-    std::string gpu_time;
-    if (gpu_time_ns != UINT64_MAX && fps_log_frames_) {
-      gpu_time = fmt::format("; GPU work {:.1f} ms per frame",
-                             double(gpu_time_ns) / 1e6 / double(fps_log_frames_));
-    }
+    const std::string gpu_time = TakeGpuTimeReport(fps_log_frames_);
     const std::string line = fmt::format(
         "{:.1f} fps over {:.1f} s, slowest frame {:.1f} ms ({} texture loads, {} KB uploaded, "
         "{} shaders translated, {} pipelines created), {} of {} frames over 33 ms; host "

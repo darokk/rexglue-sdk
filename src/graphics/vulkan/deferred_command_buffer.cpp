@@ -34,6 +34,7 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 void DeferredCommandBuffer::Reset() {
   write_block_ = 0;
   write_offset_ = 0;
+  timestamp_category_marked_ = kNoTimestampCategory;
   published_.store(0, std::memory_order_relaxed);
 }
 
@@ -87,6 +88,13 @@ void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer, const u
     stream_remaining -= kCommandHeaderSizeElements;
 
     switch (header.command) {
+      case Command::kTimestampMarker: {
+        if (timestamp_sink_) {
+          timestamp_sink_->WriteTimestamp(
+              command_buffer, reinterpret_cast<const ArgsTimestampMarker*>(stream)->category);
+        }
+      } break;
+
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);
@@ -454,6 +462,18 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
 }
 
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
+  if (timestamp_category_ != timestamp_category_marked_) {
+    timestamp_category_marked_ = timestamp_category_;
+    if (timestamp_category_ != kNoTimestampCategory) {
+      auto& marker = *reinterpret_cast<ArgsTimestampMarker*>(
+          WriteCommandRaw(Command::kTimestampMarker, sizeof(ArgsTimestampMarker)));
+      marker.category = timestamp_category_;
+    }
+  }
+  return WriteCommandRaw(command, arguments_size_bytes);
+}
+
+void* DeferredCommandBuffer::WriteCommandRaw(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
   const size_t command_size_elements = kCommandHeaderSizeElements + arguments_size_elements;

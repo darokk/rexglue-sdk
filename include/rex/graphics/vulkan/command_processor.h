@@ -159,6 +159,27 @@ class VulkanCommandProcessor : public CommandProcessor {
     return *upload_command_buffer_;
   }
 
+  // GPU time breakdown categories for the performance log: work recorded
+  // after SetGpuTimeCategory is attributed to the category.
+  enum GpuTimeCategory : uint32_t {
+    kGpuTimeOther,
+    kGpuTimeDraw,
+    kGpuTimeTessellation,
+    kGpuTimeMemexport,
+    kGpuTimeRenderTarget,
+    kGpuTimeResolve,
+    kGpuTimeTextureLoad,
+    kGpuTimeUpload,
+    kGpuTimeCategoryCount,
+  };
+  void SetGpuTimeCategory(uint32_t category) {
+    gpu_time_category_ = category;
+    if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+      deferred_command_buffer_->SetTimestampCategory(category);
+    }
+  }
+  uint32_t gpu_time_category() const { return gpu_time_category_; }
+
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
@@ -265,7 +286,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
-  uint64_t TakeGpuTimeNs() override;
+  std::string TakeGpuTimeReport(uint32_t frames) override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -642,15 +663,23 @@ class VulkanCommandProcessor : public CommandProcessor {
   void WakeSubmitWorker();
   std::atomic<bool> submit_device_lost_{false};
   uint32_t submit_publishes_since_wake_ = 0;
-  // GPU timing for the performance log: the time between timestamps at the
-  // start and the end of each submission's command buffer, summed up as the
-  // submissions complete.
-  static constexpr uint32_t kGpuTimestampSlots = 128;
+  // GPU timing for the performance log. Each submission gets a slot of
+  // timestamp queries: one at the start of its command buffer, one at each
+  // category marker, and one at the end; as the submissions complete, the
+  // time between consecutive timestamps is added to the category of the
+  // earlier one.
+  static constexpr uint32_t kGpuTimestampSlots = 64;
+  static constexpr uint32_t kGpuTimestampsPerSlot = 1024;
   VkQueryPool gpu_timestamp_pool_ = VK_NULL_HANDLE;
   uint32_t gpu_timestamp_slot_next_ = 0;
+  // Written by the submission worker before submitting, read on completion:
+  // the category of each timestamp of a slot, and how many were written.
+  std::vector<uint8_t> gpu_timestamp_categories_;
+  std::vector<uint32_t> gpu_timestamp_counts_;
   // <Submission, slot> of submitted ones whose time isn't read yet.
   std::deque<std::pair<uint64_t, uint32_t>> gpu_timestamp_pending_;
-  uint64_t gpu_time_ns_ = 0;
+  uint64_t gpu_category_ns_[kGpuTimeCategoryCount] = {};
+  uint32_t gpu_time_category_ = kGpuTimeOther;
   // Commands recorded while no submission is open (discarded, as before).
   std::unique_ptr<DeferredCommandBuffer> closed_command_buffer_;
   DeferredCommandBuffer* deferred_command_buffer_ = nullptr;
