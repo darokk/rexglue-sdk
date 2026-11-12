@@ -78,19 +78,19 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_poll_us, 200, "GPU",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(log_perf_file, true, "GPU",
+REXCVAR_DEFINE_BOOL(log_perf_file, false, "GPU",
                     "With log_guest_fps, also write the 5-second summaries, with CPU time per "
                     "thread and CPU/GPU clocks, to perf_log.txt next to the executable "
                     "(Linux; replaced at every launch)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(log_perf_profile, true, "GPU",
+REXCVAR_DEFINE_BOOL(log_perf_profile, false, "GPU",
                     "With log_perf_file, sample the GPU command thread and the main game thread "
                     "(1 sample per ms of their CPU time) and add their busiest functions to "
                     "perf_log.txt every 30 s (Linux; needs a restart to turn on)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(log_guest_fps, true, "GPU",
+REXCVAR_DEFINE_BOOL(log_guest_fps, false, "GPU",
                     "Log a guest frame rate summary every 5 seconds: average fps, the "
                     "slowest frame and how many frames took longer than 33 ms (stutters). "
                     "Measured at the guest's frame swap, so unaffected by host presentation.")
@@ -1705,6 +1705,12 @@ void CommandProcessor::HostPerfFileWrite(const std::string&, const std::string&)
 
 void CommandProcessor::LogGuestFrameTiming() {
   using Clock = std::chrono::steady_clock;
+  if (!REXCVAR_GET(log_guest_fps)) {
+    // Off (the default): no per-frame bookkeeping at all; start a fresh window
+    // if it is turned on later.
+    fps_log_window_start_ = {};
+    return;
+  }
   constexpr auto kWindow = std::chrono::seconds(5);
   constexpr auto kSlowFrame = std::chrono::microseconds(33334);
   const Clock::time_point now = Clock::now();
