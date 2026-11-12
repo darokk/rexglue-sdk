@@ -35,6 +35,28 @@
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
+REXCVAR_DEFINE_INT32(resolve_direct_to_texture, 2, "GPU/Vulkan",
+                     "Copy resolves of 8888 and 2:10:10:10 color render targets straight into "
+                     "the host textures that hold the resolved picture, instead of reloading "
+                     "those textures from guest memory: 0 = off, 1 = single-sampled render "
+                     "targets only, 2 = also averaged multisampled 8888 ones (may differ from "
+                     "the normal path by one rounding step)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(resolve_direct_mip_chains, true, "GPU/Vulkan",
+                    "With resolve_direct_to_texture, also write resolves directly into the "
+                    "mip levels of textures that have several (Fable II renders a 256x256 "
+                    "texture with three smaller levels for each character in view, every frame)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(resolve_direct_skip_memory, 2, "GPU/Vulkan",
+                     "With resolve_direct_to_texture, whether a resolve written directly to "
+                     "textures is still copied to guest memory: 0 = always, 1 = not when no "
+                     "other texture currently holds data from that memory, 2 = never (other "
+                     "textures made from that memory in another format become outdated, and "
+                     "would reload what the memory held before)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -555,6 +577,11 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if (direct_resolve_rebind_needed_) {
+    direct_resolve_rebind_needed_ = false;
+    ResetTextureBindings();
+  }
+
   TextureCache::RequestTextures(used_texture_mask);
 
   // Pre-create 3D-as-2D wrappers while still in texture request phase.
@@ -625,6 +652,216 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
                                                   dst_access_mask, old_layout, new_layout);
       }
     }
+  }
+}
+
+bool VulkanTextureCache::IsDirectResolveFormat(xenos::TextureFormat format) const {
+  switch (format) {
+    case xenos::TextureFormat::k_8_8_8_8:
+      return direct_resolve_blit_to_8888_supported_;
+    case xenos::TextureFormat::k_2_10_10_10:
+      return direct_resolve_blit_to_2101010_supported_;
+    case xenos::TextureFormat::k_1_5_5_5:
+      return direct_resolve_blit_to_1555_supported_;
+    default:
+      return false;
+  }
+}
+
+void VulkanTextureCache::GetDirectResolveLevels(
+    const VulkanTexture& texture,
+    std::vector<std::pair<uint32_t, uint32_t>>& levels_out) const {
+  levels_out.clear();
+  const TextureKey key = texture.key();
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
+      key.signed_separate || key.scaled_resolve || !key.tiled ||
+      !IsDirectResolveFormat(key.format)) {
+    return;
+  }
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  if (layout.packed_level == 0 ||
+      (key.mip_max_level && !REXCVAR_GET(resolve_direct_mip_chains))) {
+    return;
+  }
+  if (key.base_page) {
+    levels_out.emplace_back(uint32_t(key.base_page), 0);
+  }
+  if (key.mip_page) {
+    for (uint32_t level = 1; level <= key.mip_max_level && level < layout.packed_level; ++level) {
+      const uint32_t offset = layout.mip_offsets_bytes[level];
+      if (!(offset & 0xFFF)) {
+        levels_out.emplace_back(uint32_t(key.mip_page) + (offset >> 12), level);
+      }
+    }
+  }
+}
+
+bool VulkanTextureCache::PrepareDirectResolve(const draw_util::ResolveInfo& resolve_info,
+                                              uint32_t width, uint32_t height,
+                                              bool& only_dependents_out) {
+  direct_resolve_targets_.clear();
+  only_dependents_out = false;
+  if (IsDrawResolutionScaled() || !width || !height) {
+    return false;
+  }
+  const reg::RB_COPY_DEST_INFO dest_info = resolve_info.copy_dest_info;
+  xenos::TextureFormat texture_format;
+  switch (dest_info.copy_dest_format) {
+    case xenos::ColorFormat::k_8_8_8_8:
+      texture_format = xenos::TextureFormat::k_8_8_8_8;
+      break;
+    case xenos::ColorFormat::k_2_10_10_10:
+      texture_format = xenos::TextureFormat::k_2_10_10_10;
+      break;
+    case xenos::ColorFormat::k_1_5_5_5:
+      texture_format = xenos::TextureFormat::k_1_5_5_5;
+      break;
+    default:
+      return false;
+  }
+  if (!IsDirectResolveFormat(texture_format) || dest_info.copy_dest_exp_bias ||
+      dest_info.copy_dest_array || (resolve_info.copy_dest_base & 0xFFF)) {
+    return false;
+  }
+  const bool rb_swap = dest_info.copy_dest_swap != 0;
+  if (rb_swap && !command_processor_.GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+    return false;
+  }
+  const uint32_t dest_x = uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8)
+                          << xenos::kResolveAlignmentPixelsLog2;
+  const uint32_t dest_y = uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8)
+                          << xenos::kResolveAlignmentPixelsLog2;
+  const uint32_t dest_pitch =
+      uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5;
+  auto candidates_it =
+      direct_resolve_candidates_.find((resolve_info.copy_dest_base & 0x1FFFFFFF) >> 12);
+  if (candidates_it == direct_resolve_candidates_.end()) {
+    return false;
+  }
+  const uint32_t bytes_per_texel =
+      FormatInfo::Get(texture_format)->bits_per_pixel / 8;
+  for (const std::pair<VulkanTexture*, uint32_t>& candidate : candidates_it->second) {
+    VulkanTexture* texture = candidate.first;
+    const uint32_t level = candidate.second;
+    const TextureKey key = texture->key();
+    const texture_util::TextureGuestLayout& layout = texture->guest_layout();
+    const texture_util::TextureGuestLayout::Level& level_layout =
+        level ? layout.mips[level] : layout.base;
+    const uint32_t level_width = std::max(key.GetWidth() >> level, uint32_t(1));
+    const uint32_t level_height = std::max(key.GetHeight() >> level, uint32_t(1));
+    if (key.format != texture_format ||
+        uint32_t(key.endianness) != uint32_t(dest_info.copy_dest_endian) ||
+        level_layout.row_pitch_bytes != dest_pitch * bytes_per_texel || dest_x >= level_width ||
+        dest_y >= level_height) {
+      continue;
+    }
+    DirectResolveTarget target;
+    target.texture = texture;
+    target.level = level;
+    target.x = dest_x;
+    target.y = dest_y;
+    target.width = std::min(width, level_width - dest_x);
+    target.height = std::min(height, level_height - dest_y);
+    const bool whole_level =
+        !dest_x && !dest_y && target.width == level_width && target.height == level_height;
+    if (key.mip_max_level) {
+      // One level of several: the others must hold valid data. Red and blue
+      // are exchanged (or not) for the whole image; a resolve of the whole
+      // base level may change that, on the assumption that the game makes
+      // the smaller levels from it next (a mip chain rendered every frame).
+      if (texture->outdated_mask() ||
+          (texture->rb_exchanged() != rb_swap && !(whole_level && !level))) {
+        continue;
+      }
+    } else if (!whole_level && (texture->outdated_mask() || texture->rb_exchanged() != rb_swap)) {
+      // The rest of the texture must hold valid data in the same red / blue
+      // order.
+      continue;
+    }
+    direct_resolve_targets_.push_back(target);
+  }
+  if (direct_resolve_targets_.empty()) {
+    return false;
+  }
+  direct_resolve_rb_swap_ = rb_swap;
+  // Anything else holding data loaded from this memory needs the memory
+  // written (which makes it reload).
+  bool only_dependents = GetTexturesWatchingRange(resolve_info.copy_dest_extent_start,
+                                                  resolve_info.copy_dest_extent_length,
+                                                  direct_resolve_watchers_);
+  for (const std::pair<Texture*, bool>& watcher : direct_resolve_watchers_) {
+    bool is_target = false;
+    for (const DirectResolveTarget& target : direct_resolve_targets_) {
+      is_target |= target.texture == watcher.first;
+    }
+    only_dependents &= is_target;
+  }
+  only_dependents_out = only_dependents;
+  return true;
+}
+
+void VulkanTextureCache::CommitDirectResolve(const draw_util::ResolveInfo& resolve_info,
+                                             VkImage source_image,
+                                             DeferredCommandBuffer::ImageCopyMode mode,
+                                             int32_t source_x, int32_t source_y,
+                                             bool invalidate_others) {
+  if (direct_resolve_targets_.empty()) {
+    return;
+  }
+  if (invalidate_others) {
+    shared_memory().InvalidateWatchesInRange(resolve_info.copy_dest_extent_start,
+                                             resolve_info.copy_dest_extent_length);
+  }
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  VkPipelineStageFlags dst_stage_mask;
+  VkAccessFlags dst_access_mask;
+  VkImageLayout new_layout;
+  GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, dst_stage_mask,
+                       dst_access_mask, new_layout);
+  for (const DirectResolveTarget& target : direct_resolve_targets_) {
+    VulkanTexture& texture = *target.texture;
+    texture.MarkAsUsed();
+    VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+    if (old_usage != VulkanTexture::Usage::kTransferDestination) {
+      VkPipelineStageFlags src_stage_mask;
+      VkAccessFlags src_access_mask;
+      VkImageLayout old_layout;
+      GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+      command_processor_.PushImageMemoryBarrier(texture.image(),
+                                                ui::vulkan::util::InitializeSubresourceRange(),
+                                                src_stage_mask, dst_stage_mask, src_access_mask,
+                                                dst_access_mask, old_layout, new_layout);
+    }
+  }
+  command_processor_.SubmitBarriers(true);
+  bool views_changed = false;
+  for (const DirectResolveTarget& target : direct_resolve_targets_) {
+    VulkanTexture& texture = *target.texture;
+    VkImageCopy region = {};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.srcOffset.x = source_x;
+    region.srcOffset.y = source_y;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.mipLevel = target.level;
+    region.dstSubresource.layerCount = 1;
+    region.dstOffset.x = int32_t(target.x);
+    region.dstOffset.y = int32_t(target.y);
+    region.extent.width = target.width;
+    region.extent.height = target.height;
+    region.extent.depth = 1;
+    command_buffer.CmdVkCopyOrResolveImage(mode, source_image,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image(),
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+    if (texture.rb_exchanged() != direct_resolve_rb_swap_) {
+      texture.set_rb_exchanged(direct_resolve_rb_swap_);
+      views_changed = true;
+    }
+    // Outdated before, or made so by the write to memory: up to date now.
+    MakeTextureUpToDateAndWatch(texture);
+  }
+  if (views_changed) {
+    ResetTextureBindings();
   }
 }
 
@@ -1257,6 +1494,24 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
 
+  if (load_base && vulkan_texture.rb_exchanged()) {
+    // Loaded from memory again after a red/blue-exchanging direct resolve.
+    vulkan_texture.set_rb_exchanged(false);
+    direct_resolve_rebind_needed_ = true;
+  }
+  if (!vulkan_texture.direct_resolve_candidate()) {
+    // Levels a resolve may be copied to directly later.
+    std::vector<std::pair<uint32_t, uint32_t>> direct_levels;
+    GetDirectResolveLevels(vulkan_texture, direct_levels);
+    if (!direct_levels.empty()) {
+      vulkan_texture.set_direct_resolve_candidate();
+      for (const std::pair<uint32_t, uint32_t>& direct_level : direct_levels) {
+        direct_resolve_candidates_[direct_level.first].emplace_back(&vulkan_texture,
+                                                                    direct_level.second);
+      }
+    }
+  }
+
   // Get the pipeline.
   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
   bool host_format_is_signed;
@@ -1881,6 +2136,26 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cac
 }
 
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+  if (direct_resolve_candidate_) {
+    VulkanTextureCache& cache = static_cast<VulkanTextureCache&>(texture_cache());
+    std::vector<std::pair<uint32_t, uint32_t>> direct_levels;
+    cache.GetDirectResolveLevels(*this, direct_levels);
+    for (const std::pair<uint32_t, uint32_t>& direct_level : direct_levels) {
+      auto candidates_it = cache.direct_resolve_candidates_.find(direct_level.first);
+      if (candidates_it == cache.direct_resolve_candidates_.end()) {
+        continue;
+      }
+      auto& entries = candidates_it->second;
+      entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                   [this](const std::pair<VulkanTexture*, uint32_t>& entry) {
+                                     return entry.first == this;
+                                   }),
+                    entries.end());
+      if (entries.empty()) {
+        cache.direct_resolve_candidates_.erase(candidates_it);
+      }
+    }
+  }
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -1904,6 +2179,22 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
   xenos::DataDimension dimension = key().dimension;
   if (dimension == xenos::DataDimension::k3D || dimension == xenos::DataDimension::kCube) {
     is_array = false;
+  }
+
+  if (rb_exchanged_) {
+    // The image holds red where a load from memory would have put blue, and
+    // the other way round (see set_rb_exchanged).
+    uint32_t exchanged_swizzle = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint32_t component = (host_swizzle >> (3 * i)) & 0b111;
+      if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_R) {
+        component = xenos::XE_GPU_TEXTURE_SWIZZLE_B;
+      } else if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_B) {
+        component = xenos::XE_GPU_TEXTURE_SWIZZLE_R;
+      }
+      exchanged_swizzle |= component << (3 * i);
+    }
+    host_swizzle = exchanged_swizzle;
   }
 
   // Usually the same view as last time (views are never destroyed before the
@@ -2419,6 +2710,25 @@ bool VulkanTextureCache::Initialize() {
   VkFormatProperties r16g16b16a16_sfloat_properties;
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_R16G16B16A16_SFLOAT,
                                           &r16g16b16a16_sfloat_properties);
+  // Direct resolves (resolve_direct_to_texture) copy or blit into the textures
+  // of these formats.
+  {
+    auto can_blit_to = [&](xenos::TextureFormat guest_format, VkFormat expected_format) {
+      if (host_formats_[uint32_t(guest_format)].format_unsigned.format != expected_format) {
+        return false;
+      }
+      VkFormatProperties properties;
+      ifn.vkGetPhysicalDeviceFormatProperties(physical_device, expected_format, &properties);
+      return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+    };
+    direct_resolve_blit_to_8888_supported_ =
+        can_blit_to(xenos::TextureFormat::k_8_8_8_8, VK_FORMAT_R8G8B8A8_UNORM);
+    direct_resolve_blit_to_2101010_supported_ =
+        can_blit_to(xenos::TextureFormat::k_2_10_10_10, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    direct_resolve_blit_to_1555_supported_ =
+        can_blit_to(xenos::TextureFormat::k_1_5_5_5, VK_FORMAT_A1R5G5B5_UNORM_PACK16);
+  }
+
   VkFormatProperties format_properties;
   // k_Cr_Y1_Cb_Y0_REP, k_Y1_Cr_Y0_Cb_REP.
   HostFormatPair& host_format_gbgr =

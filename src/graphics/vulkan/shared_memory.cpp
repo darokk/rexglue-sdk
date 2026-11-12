@@ -25,7 +25,7 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_BOOL(shared_memory_skip_unchanged_uploads, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(shared_memory_skip_unchanged_uploads, false, "GPU/Vulkan",
                     "When guest memory is uploaded to the GPU again, compare each page with a "
                     "hash of what was last uploaded and skip the copy for unchanged pages (and "
                     "the reload of textures whose pages are all unchanged)");

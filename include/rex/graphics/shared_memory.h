@@ -11,6 +11,7 @@
  */
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -72,6 +73,17 @@ class SharedMemory {
                                uint64_t callback_argument);
   // Unregisters previously registered watched memory range.
   void UnwatchMemoryRange(WatchHandle handle);
+  // Fires (and so cancels) the watches of the range as a write by the GPU
+  // would, without changing what the buffer holds or which pages are valid:
+  // for when the data went somewhere else than the buffer.
+  void InvalidateWatchesInRange(uint32_t start, uint32_t length);
+  // Calls the function for every watched range overlapping the memory range
+  // (possibly more than once for one watch), within the global critical
+  // region. Don't watch or unwatch ranges from it.
+  void ForEachWatchedRange(
+      uint32_t start, uint32_t length,
+      const std::function<void(WatchCallback callback, void* context, void* data,
+                               uint64_t argument)>& function);
 
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
@@ -203,6 +215,12 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+  // Pages made writable again by a CPU write notification and not protected
+  // since (see shared_memory_protect_ahead).
+  std::vector<uint64_t> system_page_flags_unprotected_;
+  // Per 64-page block: score of write faults on pages that were protected
+  // ahead of their upload (bit 7 set = protecting ahead is off for the block).
+  std::vector<uint8_t> protect_ahead_block_scores_;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

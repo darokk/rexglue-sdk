@@ -553,6 +553,18 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
 
+  // Textures whose current host contents were loaded from memory overlapping
+  // the range and are still up to date with it (each with whether it's their
+  // mip tail, not their base level, that overlaps). Returns false if something
+  // other than a texture watches the range as well.
+  bool GetTexturesWatchingRange(uint32_t start, uint32_t length,
+                                std::vector<std::pair<Texture*, bool>>& textures_out);
+  // For a texture the implementation has filled with the current data of its
+  // memory range by itself, without a load.
+  void MakeTextureUpToDateAndWatch(Texture& texture) {
+    texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  }
+
  private:
   struct PendingTextureLoad {
     Texture* texture = nullptr;

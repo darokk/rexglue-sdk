@@ -18,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_dump.h>
 #include <rex/graphics/frame_events.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -368,6 +369,25 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
   return host_swizzle;
 }
 
+bool TextureCache::GetTexturesWatchingRange(
+    uint32_t start, uint32_t length, std::vector<std::pair<Texture*, bool>>& textures_out) {
+  textures_out.clear();
+  bool only_textures = true;
+  shared_memory().ForEachWatchedRange(
+      start, length,
+      [&](SharedMemory::WatchCallback callback, void* context, void* data, uint64_t argument) {
+        if (callback != WatchCallback) {
+          only_textures = false;
+          return;
+        }
+        const std::pair<Texture*, bool> entry(static_cast<Texture*>(context), argument != 0);
+        if (std::find(textures_out.begin(), textures_out.end(), entry) == textures_out.end()) {
+          textures_out.push_back(entry);
+        }
+      });
+  return only_textures;
+}
+
 bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
                                       PendingSharedMemoryRange* pending_ranges_out,
                                       size_t& pending_range_count_out) {
@@ -473,6 +493,19 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
         (load_mips && shared_memory().IsRangeGpuWritten(texture_key.mip_page << 12,
                                                         uint32_t(texture.GetGuestMipsSize())))) {
       CountFrameEvent(g_frame_events.texture_loads_gpu_written);
+      if (g_frame_dump.active) {
+        ++g_frame_dump.frame_texture_loads;
+        FrameDumpEvent(fmt::format(
+            "  texture load of GPU-written data: base {:08X} mips {:08X}, {}x{}x{} pitch {}, "
+            "format {}, endian {}, {}{}{} mip levels{}{}",
+            uint32_t(texture_key.base_page) << 12, uint32_t(texture_key.mip_page) << 12,
+            texture_key.GetWidth(), texture_key.GetHeight(), texture_key.GetDepthOrArraySize(),
+            uint32_t(texture_key.pitch) << 5, uint32_t(texture_key.format),
+            uint32_t(texture_key.endianness), texture_key.tiled ? "tiled, " : "",
+            texture_key.packed_mips ? "packed mips, " : "", uint32_t(texture_key.mip_max_level) + 1,
+            texture_key.signed_separate ? ", signed" : "",
+            texture_key.scaled_resolve ? ", scaled" : ""));
+      }
     }
     if (load_base) {
       texture.base_content_hash_ = base_hash;

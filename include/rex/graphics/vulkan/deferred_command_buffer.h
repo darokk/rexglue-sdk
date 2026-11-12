@@ -238,6 +238,29 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  // One region, of the same size in both, between two color images.
+  enum class ImageCopyMode : uint32_t {
+    // vkCmdCopyImage: same format, single-sampled source.
+    kCopy,
+    // vkCmdResolveImage: same format, multisampled source (samples averaged).
+    kResolve,
+    // vkCmdBlitImage (nearest): converts between formats, single-sampled
+    // source.
+    kBlit,
+  };
+  void CmdVkCopyOrResolveImage(ImageCopyMode mode, VkImage src_image,
+                               VkImageLayout src_image_layout, VkImage dst_image,
+                               VkImageLayout dst_image_layout, const VkImageCopy& region) {
+    auto& args = *reinterpret_cast<ArgsVkCopyOrResolveImage*>(
+        WriteCommand(Command::kVkCopyOrResolveImage, sizeof(ArgsVkCopyOrResolveImage)));
+    args.src_image = src_image;
+    args.dst_image = dst_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image_layout = dst_image_layout;
+    args.mode = mode;
+    args.region = region;
+  }
+
   void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count,
                                  VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
                                  VkQueryResultFlags flags) {
@@ -403,6 +426,7 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkCopyOrResolveImage,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,
@@ -526,6 +550,15 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyOrResolveImage {
+    VkImage src_image;
+    VkImage dst_image;
+    VkImageLayout src_image_layout;
+    VkImageLayout dst_image_layout;
+    ImageCopyMode mode;
+    VkImageCopy region;
   };
 
   struct ArgsVkCopyQueryPoolResults {

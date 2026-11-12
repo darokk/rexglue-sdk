@@ -204,6 +204,37 @@ void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer, const u
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkCopyOrResolveImage: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyOrResolveImage*>(stream);
+        if (args.mode == ImageCopyMode::kBlit) {
+          VkImageBlit region;
+          region.srcSubresource = args.region.srcSubresource;
+          region.srcOffsets[0] = args.region.srcOffset;
+          region.srcOffsets[1].x = args.region.srcOffset.x + int32_t(args.region.extent.width);
+          region.srcOffsets[1].y = args.region.srcOffset.y + int32_t(args.region.extent.height);
+          region.srcOffsets[1].z = 1;
+          region.dstSubresource = args.region.dstSubresource;
+          region.dstOffsets[0] = args.region.dstOffset;
+          region.dstOffsets[1].x = args.region.dstOffset.x + int32_t(args.region.extent.width);
+          region.dstOffsets[1].y = args.region.dstOffset.y + int32_t(args.region.extent.height);
+          region.dstOffsets[1].z = 1;
+          dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                             args.dst_image_layout, 1, &region, VK_FILTER_NEAREST);
+        } else if (args.mode == ImageCopyMode::kResolve) {
+          VkImageResolve region;
+          region.srcSubresource = args.region.srcSubresource;
+          region.srcOffset = args.region.srcOffset;
+          region.dstSubresource = args.region.dstSubresource;
+          region.dstOffset = args.region.dstOffset;
+          region.extent = args.region.extent;
+          dfn.vkCmdResolveImage(command_buffer, args.src_image, args.src_image_layout,
+                                args.dst_image, args.dst_image_layout, 1, &region);
+        } else {
+          dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                             args.dst_image_layout, 1, &args.region);
+        }
+      } break;
+
       case Command::kVkCopyQueryPoolResults: {
         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,

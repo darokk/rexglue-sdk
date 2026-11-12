@@ -32,6 +32,7 @@
 #include <rex/thread.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_dump.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
@@ -67,7 +68,10 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_unused_index_address, true, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_reuse_texture_descriptor_sets, true, "GPU/Vulkan",
                     "Reuse a texture descriptor set written earlier in the submission when a "
                     "draw needs identical contents");
-REXCVAR_DEFINE_BOOL(readback_resolve_force_delayed, false, "GPU",
+// On by default: Fable II regenerates its forced readback texture (hero / dog
+// skin) every frame, and waiting for the GPU at each one made the frame rate a
+// third lower on the Steam Deck.
+REXCVAR_DEFINE_BOOL(readback_resolve_force_delayed, true, "GPU",
                     "Read back resolves forced by readback_resolve_force_addresses one resolve "
                     "late (double-buffered, like readback_resolve = fast) instead of waiting for "
                     "the GPU to go idle at every one. Saves a full CPU/GPU sync per resolve when "
@@ -4314,6 +4318,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
 
+  if (g_frame_dump.active) {
+    FrameDumpDraw(regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                  regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], bin_select_, bin_mask_,
+                  vertex_shader->ucode_data_hash(),
+                  pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                  primitive_processing_result.host_draw_vertex_count,
+                  primitive_processing_result.IsTessellated(), memexport_writes_possible);
+  }
+
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -4634,7 +4647,7 @@ bool VulkanCommandProcessor::IssueCopy() {
       !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+                                         written_address, written_length, false);
   }
 
   return IssueCopy_ReadbackResolvePath();

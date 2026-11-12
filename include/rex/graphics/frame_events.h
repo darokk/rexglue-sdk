@@ -31,6 +31,10 @@ struct FrameEvents {
   std::atomic<uint64_t> resolves{0};
   std::atomic<uint64_t> resolve_dump_tiles{0};
   std::atomic<uint64_t> resolve_clears{0};
+  // Resolves copied straight from the host render target into the host
+  // textures using the data, and how many of them skipped the copy to memory.
+  std::atomic<uint64_t> resolves_direct{0};
+  std::atomic<uint64_t> resolves_direct_memory_skipped{0};
   std::atomic<uint64_t> shader_translations{0};
   std::atomic<uint64_t> pipelines_created{0};
 };

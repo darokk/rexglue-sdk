@@ -47,6 +47,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_dump.h>
 #include <rex/graphics/frame_events.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -88,6 +89,13 @@ REXCVAR_DEFINE_BOOL(log_perf_profile, false, "GPU",
                     "With log_perf_file, sample the GPU command thread and the main game thread "
                     "(1 sample per ms of their CPU time) and add their busiest functions to "
                     "perf_log.txt every 30 s (Linux; needs a restart to turn on)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(log_frame_dump, false, "GPU",
+                    "Every 20 s, append what one guest frame does with render targets "
+                    "(bindings, ownership transfers, resolves, texture loads of GPU-written "
+                    "data, draws in between) to frame_dump.txt next to the executable, up to 40 "
+                    "frames per launch")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(log_guest_fps, false, "GPU",
@@ -1144,9 +1152,10 @@ std::string ReadSmallFile(const std::string& path) {
 // instruction address into a ring buffer. Every 30 s the addresses are mapped
 // to function names (from the modules' ELF symbol tables, which the packaged
 // binaries keep) and the top functions per thread are written to the log.
-constexpr int kProfThreads = 2;  // 0 = GPU Commands, 1 = GameThread
+constexpr int kProfThreads = 4;  // GPU Commands, GameThread, 3D Engine, GPU Submit
 constexpr uint32_t kProfRing = 1u << 16;
-const char* const kProfThreadPrefix[kProfThreads] = {"GPU Commands", "GameThread"};
+const char* const kProfThreadPrefix[kProfThreads] = {"GPU Commands", "GameThread", "3D Engine",
+                                                    "GPU Submit"};
 
 struct ProfRing {
   std::atomic<uint32_t> head{0};
@@ -1295,7 +1304,7 @@ struct HostPerfState {
   uint64_t texture_loads_skipped_reported = 0;
   uint64_t upload_bytes_skipped_reported = 0;
   // EDRAM emulation counters of the "EDRAM per frame" line.
-  uint64_t gpu_emulation_reported[8] = {};
+  uint64_t gpu_emulation_reported[10] = {};
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1629,7 +1638,7 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
 
   // EDRAM emulation work: render target ownership transfers, resolves, and
   // texture loads of GPU-written data.
-  const uint64_t gpu_emulation[8] = {
+  const uint64_t gpu_emulation[10] = {
       g_frame_events.rt_transfers.load(std::memory_order_relaxed),
       g_frame_events.rt_transfer_tiles.load(std::memory_order_relaxed),
       g_frame_events.rt_transfers_to_depth.load(std::memory_order_relaxed),
@@ -1637,19 +1646,22 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       g_frame_events.resolves.load(std::memory_order_relaxed),
       g_frame_events.resolve_dump_tiles.load(std::memory_order_relaxed),
       g_frame_events.resolve_clears.load(std::memory_order_relaxed),
-      g_frame_events.texture_loads_gpu_written.load(std::memory_order_relaxed)};
-  uint64_t gpu_emulation_per_frame[8];
-  for (int i = 0; i < 8; ++i) {
+      g_frame_events.texture_loads_gpu_written.load(std::memory_order_relaxed),
+      g_frame_events.resolves_direct.load(std::memory_order_relaxed),
+      g_frame_events.resolves_direct_memory_skipped.load(std::memory_order_relaxed)};
+  uint64_t gpu_emulation_per_frame[10];
+  for (int i = 0; i < 10; ++i) {
     gpu_emulation_per_frame[i] = per_frame(gpu_emulation[i], s.gpu_emulation_reported[i]);
     s.gpu_emulation_reported[i] = gpu_emulation[i];
   }
   out += fmt::format(
-      "\n         EDRAM per frame: {} render target copies ({} tiles, {} to depth; +{} skipped "
-      "as overwritten), {} resolves ({} tiles dumped), {} resolve clears, {} texture loads of "
-      "GPU-written data",
+      "\n         EDRAM per frame: {} render target copies ({} tiles, {} to depth; +{} "
+      "skipped), {} resolves ({} tiles dumped; {} direct to texture, {} of those without the "
+      "memory copy), {} resolve clears, {} texture loads of GPU-written data",
       gpu_emulation_per_frame[0], gpu_emulation_per_frame[1], gpu_emulation_per_frame[2],
       gpu_emulation_per_frame[3], gpu_emulation_per_frame[4], gpu_emulation_per_frame[5],
-      gpu_emulation_per_frame[6], gpu_emulation_per_frame[7]);
+      gpu_emulation_per_frame[8], gpu_emulation_per_frame[9], gpu_emulation_per_frame[6],
+      gpu_emulation_per_frame[7]);
 
   if (++s.prof_reports % 6 == 0) {  // every 30 s
     out += ProfReport(s);
@@ -1703,7 +1715,63 @@ std::string CommandProcessor::HostPerfReport(double) { return {}; }
 void CommandProcessor::HostPerfFileWrite(const std::string&, const std::string&) {}
 #endif
 
+namespace {
+
+// Ends the frame being dumped (writes it out) and decides whether to dump the
+// next one. Called at every guest frame swap.
+void FrameDumpOnSwap() {
+  FrameDump& d = g_frame_dump;
+  if (d.active) {
+    d.active = false;
+    FrameDumpFlushRun();
+    std::string path = "frame_dump.txt";
+#if defined(__linux__)
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+      exe[n] = 0;
+      std::string dir(exe);
+      dir.resize(dir.rfind('/') + 1);
+      path = dir + path;
+    }
+#endif
+    if (std::FILE* file = std::fopen(path.c_str(), d.captures ? "a" : "w")) {
+      const std::time_t t = std::time(nullptr);
+      char stamp[16];
+      std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&t));
+      std::fprintf(file,
+                   "===== frame dump %u at %s: %u draws, %u transfers (+%u skipped), %u resolves "
+                   "(%u direct to texture), %u texture loads of GPU-written data =====\n",
+                   d.captures + 1, stamp, d.frame_draws, d.frame_transfers,
+                   d.frame_transfers_skipped, d.frame_resolves, d.frame_direct_resolves,
+                   d.frame_texture_loads);
+      std::fwrite(d.text.data(), 1, d.text.size(), file);
+      std::fputc('\n', file);
+      std::fclose(file);
+    }
+    ++d.captures;
+    d.text.clear();
+  }
+  if (!REXCVAR_GET(log_frame_dump) || d.captures >= 40) {
+    return;
+  }
+  const double now =
+      std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (d.next_capture_time == 0.0) {
+    d.next_capture_time = now + 20.0;
+  } else if (now >= d.next_capture_time) {
+    d.next_capture_time = now + 20.0;
+    d.active = true;
+    d.frame_draws = d.frame_transfers = d.frame_transfers_skipped = d.frame_resolves =
+        d.frame_direct_resolves = d.frame_texture_loads = 0;
+    d.text.reserve(1 << 18);
+  }
+}
+
+}  // namespace
+
 void CommandProcessor::LogGuestFrameTiming() {
+  FrameDumpOnSwap();
   using Clock = std::chrono::steady_clock;
   if (!REXCVAR_GET(log_guest_fps)) {
     // Off (the default): no per-frame bookkeeping at all; start a fresh window

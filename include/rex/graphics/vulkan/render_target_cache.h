@@ -120,9 +120,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.
+  // memory_copy_required: the resolved data is going to be read back from the
+  // shared memory buffer, so a direct resolve to textures can't replace the
+  // copy to memory.
   bool Resolve(const memory::Memory& memory, VulkanSharedMemory& shared_memory,
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out, bool memory_copy_required = true);
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
