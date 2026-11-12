@@ -4013,6 +4013,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SetGpuTimeCategory(kGpuTimeRenderTarget);
   render_target_cache_->SetDepthOverwrittenByNextUpdate(
       fable2::ShouldSkipDepthTransfers(regs, *memory_, *vertex_shader));
+  render_target_cache_->SetNextUpdateDrawState(pixel_shader, normalized_depth_control);
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     SetGpuTimeCategory(kGpuTimeDraw);
@@ -5853,8 +5854,9 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
     return {};
   }
   static constexpr const char* kCategoryNames[kGpuTimeCategoryCount] = {
-      "other", "draws", "tessellated draws", "memexport draws", "render target copies",
-      "resolves", "texture loads", "uploads"};
+      "other",         "draws",          "tessellated draws", "memexport draws",
+      "render target copies", "resolve dumps", "resolve copies", "resolve clears",
+      "texture loads", "uploads"};
   uint64_t total_ns = 0;
   for (uint64_t ns : gpu_category_ns_) {
     total_ns += ns;

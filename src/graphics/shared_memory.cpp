@@ -127,6 +127,28 @@ void SharedMemory::InvalidateRangeForReupload(uint32_t start, uint32_t length) {
   }
 }
 
+bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) const {
+  if (!length || start >= kBufferSize || system_page_flags_valid_and_gpu_written_.empty()) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t i = page_first >> 6; i <= page_last >> 6; ++i) {
+    uint64_t bits = system_page_flags_valid_and_gpu_written_[i];
+    if (i == page_first >> 6) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == page_last >> 6 && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (bits) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool SharedMemory::GetRangeContentHash(uint32_t start, uint32_t length,
                                        uint64_t& hash_out) const {
   if (!length || start >= kBufferSize || page_content_hashes_.empty()) {

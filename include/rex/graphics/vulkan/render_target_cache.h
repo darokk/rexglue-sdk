@@ -38,6 +38,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void SetDepthOverwrittenByNextUpdate(bool overwritten) {
     depth_overwritten_by_next_update_ = overwritten;
   }
+  // Set before Update: the draw's pixel shader and normalized depth control,
+  // to skip copying old contents into color render targets that the draw
+  // overwrites completely (see ColorRenderTargetsOverwritten).
+  void SetNextUpdateDrawState(const Shader* pixel_shader,
+                              reg::RB_DEPTHCONTROL normalized_depth_control) {
+    next_update_pixel_shader_ = pixel_shader;
+    next_update_depth_control_ = normalized_depth_control;
+  }
 
   union RenderPassKey {
     struct {
@@ -185,6 +193,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
  private:
   bool depth_overwritten_by_next_update_ = false;
+  const Shader* next_update_pixel_shader_ = nullptr;
+  reg::RB_DEPTHCONTROL next_update_depth_control_ = {};
+  // Clears the transfers into the color render targets (slots 1-4 of the last
+  // update) that the current draw overwrites completely, before they are
+  // performed. Returns the number of transfers dropped.
+  uint32_t SkipTransfersOverwrittenByDraw(const Shader& vertex_shader,
+                                          RenderTarget* const* render_targets,
+                                          std::vector<Transfer>* transfers);
 
   enum class EdramBufferUsage {
     // There's no need for combined fragment and compute usages.

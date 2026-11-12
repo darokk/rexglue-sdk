@@ -468,6 +468,12 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
       return false;
     }
     CountFrameEvent(g_frame_events.texture_loads);
+    if ((load_base && shared_memory().IsRangeGpuWritten(texture_key.base_page << 12,
+                                                        uint32_t(texture.GetGuestBaseSize()))) ||
+        (load_mips && shared_memory().IsRangeGpuWritten(texture_key.mip_page << 12,
+                                                        uint32_t(texture.GetGuestMipsSize())))) {
+      CountFrameEvent(g_frame_events.texture_loads_gpu_written);
+    }
     if (load_base) {
       texture.base_content_hash_ = base_hash;
     }

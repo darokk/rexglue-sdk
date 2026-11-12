@@ -24,6 +24,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_events.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/pipeline/texture/cache.h>
@@ -40,6 +41,12 @@
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(skip_color_overwrite_transfers, true, "GPU/Vulkan",
+                    "Don't copy the previous EDRAM contents into a color render target when "
+                    "the draw that needs it is a single rectangle writing every pixel of the "
+                    "copied area unconditionally (no blending, alpha test, discard, depth or "
+                    "stencil test, all components written)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // DEFINE_string(
 //     render_target_path_vulkan, "",
@@ -1163,7 +1170,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
       bool direct_resolved = false;
+      CountFrameEvent(g_frame_events.resolves);
       if (GetPath() == Path::kHostRenderTargets) {
+        // GPU time breakdown: copying the host render targets to the EDRAM
+        // buffer.
+        command_processor_.SetGpuTimeCategory(VulkanCommandProcessor::kGpuTimeResolveDump);
+        {
+          uint32_t span_base, span_row_length, span_rows, span_pitch;
+          resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
+          CountFrameEvent(g_frame_events.resolve_dump_tiles, uint64_t(span_row_length) * span_rows);
+        }
         if (REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
@@ -1252,6 +1268,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0, nullptr);
 
           // Submit the resolve.
+          command_processor_.SetGpuTimeCategory(VulkanCommandProcessor::kGpuTimeResolve);
           if (draw_resolution_scaled) {
             texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
           } else {
@@ -1303,6 +1320,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
   if (clear_depth || clear_color) {
+    CountFrameEvent(g_frame_events.resolve_clears);
+    command_processor_.SetGpuTimeCategory(VulkanCommandProcessor::kGpuTimeResolveClear);
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
         Transfer::Rectangle clear_rectangle;
@@ -1377,6 +1396,115 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied && cleared;
 }
 
+uint32_t VulkanRenderTargetCache::SkipTransfersOverwrittenByDraw(
+    const Shader& vertex_shader, RenderTarget* const* render_targets,
+    std::vector<Transfer>* transfers) {
+  bool any_color_transfers = false;
+  for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    any_color_transfers |= render_targets[i] && !transfers[i].empty();
+  }
+  const Shader* pixel_shader = next_update_pixel_shader_;
+  if (!any_color_transfers || !pixel_shader) {
+    return 0;
+  }
+  const RegisterFile& regs = register_file();
+
+  // Whole-draw conditions: every covered sample of every render target gets
+  // the pixel shader's output - nothing can reject a pixel or a sample.
+  if (pixel_shader->kills_pixels()) {
+    return 0;
+  }
+  // A culled rectangle draws nothing; wireframe draws only the edges.
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  // (Only kDualMode selects point or line polygons; other values are
+  // triangles, see xenos::PolygonModeEnable.)
+  if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back ||
+      pa_su_sc_mode_cntl.poly_mode == xenos::PolygonModeEnable::kDualMode) {
+    return 0;
+  }
+  auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+  if ((rb_colorcontrol.alpha_test_enable &&
+       rb_colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
+      rb_colorcontrol.alpha_to_mask_enable) {
+    return 0;
+  }
+  const reg::RB_DEPTHCONTROL depth_control = next_update_depth_control_;
+  if ((depth_control.z_enable && depth_control.zfunc != xenos::CompareFunction::kAlways) ||
+      (depth_control.stencil_enable &&
+       (depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
+        (depth_control.backface_enable &&
+         depth_control.stencilfunc_bf != xenos::CompareFunction::kAlways)))) {
+    return 0;
+  }
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+  if (msaa_samples != xenos::MsaaSamples::k1X &&
+      (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xF) != 0xF) {
+    return 0;
+  }
+  float left, top, right, bottom;
+  if (!draw_extent_estimator().EstimateRectangle(vertex_shader, left, top, right, bottom)) {
+    return 0;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor, false);
+
+  const uint32_t surface_pitch = rb_surface_info.surface_pitch;
+  const uint32_t tile_height_pixels =
+      xenos::kEdramTileHeightSamples >> uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
+  const uint32_t rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  uint32_t skipped = 0;
+  for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    RenderTarget* render_target = render_targets[i];
+    std::vector<Transfer>& rt_transfers = transfers[i];
+    if (!render_target || rt_transfers.empty()) {
+      continue;
+    }
+    const uint32_t rt_index = i - 1;
+    if (!pixel_shader->writes_color_target(rt_index)) {
+      continue;
+    }
+    // All components of the format written, without blending.
+    auto color_info =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt_index]);
+    const uint32_t component_mask =
+        (uint32_t(1) << xenos::GetColorRenderTargetFormatComponentCount(color_info.color_format)) -
+        1;
+    if (((rb_color_mask >> (4 * rt_index)) & component_mask) != component_mask) {
+      continue;
+    }
+    auto blend_control =
+        regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[rt_index]);
+    if (blend_control.color_srcblend != xenos::BlendFactor::kOne ||
+        blend_control.color_destblend != xenos::BlendFactor::kZero ||
+        blend_control.color_comb_fcn != xenos::BlendOp::kAdd ||
+        blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+        blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+        blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      continue;
+    }
+    // The rectangle and the scissor must cover every row of tiles the
+    // transfers would copy, across the surface width.
+    const uint32_t pitch_tiles = render_target->key().GetPitchTiles();
+    uint32_t end_tiles = 0;
+    for (const Transfer& transfer : rt_transfers) {
+      end_tiles = std::max(end_tiles, transfer.end_tiles);
+    }
+    const uint32_t rows_pixels = (end_tiles + pitch_tiles - 1) / pitch_tiles * tile_height_pixels;
+    if (!(left <= 0.0f && top <= 0.0f && right >= float(surface_pitch) &&
+          bottom >= float(rows_pixels))) {
+      continue;
+    }
+    if (scissor.offset[0] || scissor.offset[1] || scissor.extent[0] < surface_pitch ||
+        scissor.extent[1] < rows_pixels) {
+      continue;
+    }
+    skipped += uint32_t(rt_transfers.size());
+    rt_transfers.clear();
+  }
+  return skipped;
+}
+
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -1399,6 +1527,23 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       if (depth_overwritten_by_next_update_ && depth_and_color_render_targets[0]) {
         // Slot 0 is depth, and the draw replaces it, so its old contents are not needed.
         const_cast<std::vector<Transfer>*>(last_update_transfers())[0].clear();
+      }
+      if (REXCVAR_GET(skip_color_overwrite_transfers)) {
+        CountFrameEvent(
+            g_frame_events.rt_transfers_skipped,
+            SkipTransfersOverwrittenByDraw(
+                vertex_shader, depth_and_color_render_targets,
+                const_cast<std::vector<Transfer>*>(last_update_transfers())));
+      }
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        for (const Transfer& transfer : last_update_transfers()[i]) {
+          CountFrameEvent(g_frame_events.rt_transfers);
+          CountFrameEvent(g_frame_events.rt_transfer_tiles,
+                          transfer.end_tiles - transfer.start_tiles);
+          if (i == 0) {
+            CountFrameEvent(g_frame_events.rt_transfers_to_depth);
+          }
+        }
       }
 
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,

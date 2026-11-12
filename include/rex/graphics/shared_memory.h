@@ -105,6 +105,10 @@ class SharedMemory {
   // if any of them is unknown.
   bool GetRangeContentHash(uint32_t start, uint32_t length, uint64_t& hash_out) const;
 
+  // Whether any page in the range holds data written by the GPU (for
+  // statistics - read without the global critical region).
+  bool IsRangeGpuWritten(uint32_t start, uint32_t length) const;
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

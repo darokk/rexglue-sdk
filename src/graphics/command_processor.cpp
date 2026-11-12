@@ -1294,6 +1294,8 @@ struct HostPerfState {
   uint64_t upload_bytes_reported = 0;
   uint64_t texture_loads_skipped_reported = 0;
   uint64_t upload_bytes_skipped_reported = 0;
+  // EDRAM emulation counters of the "EDRAM per frame" line.
+  uint64_t gpu_emulation_reported[8] = {};
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1624,6 +1626,30 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
   s.upload_bytes_reported = upload_bytes;
   s.texture_loads_skipped_reported = texture_loads_skipped;
   s.upload_bytes_skipped_reported = upload_bytes_skipped;
+
+  // EDRAM emulation work: render target ownership transfers, resolves, and
+  // texture loads of GPU-written data.
+  const uint64_t gpu_emulation[8] = {
+      g_frame_events.rt_transfers.load(std::memory_order_relaxed),
+      g_frame_events.rt_transfer_tiles.load(std::memory_order_relaxed),
+      g_frame_events.rt_transfers_to_depth.load(std::memory_order_relaxed),
+      g_frame_events.rt_transfers_skipped.load(std::memory_order_relaxed),
+      g_frame_events.resolves.load(std::memory_order_relaxed),
+      g_frame_events.resolve_dump_tiles.load(std::memory_order_relaxed),
+      g_frame_events.resolve_clears.load(std::memory_order_relaxed),
+      g_frame_events.texture_loads_gpu_written.load(std::memory_order_relaxed)};
+  uint64_t gpu_emulation_per_frame[8];
+  for (int i = 0; i < 8; ++i) {
+    gpu_emulation_per_frame[i] = per_frame(gpu_emulation[i], s.gpu_emulation_reported[i]);
+    s.gpu_emulation_reported[i] = gpu_emulation[i];
+  }
+  out += fmt::format(
+      "\n         EDRAM per frame: {} render target copies ({} tiles, {} to depth; +{} skipped "
+      "as overwritten), {} resolves ({} tiles dumped), {} resolve clears, {} texture loads of "
+      "GPU-written data",
+      gpu_emulation_per_frame[0], gpu_emulation_per_frame[1], gpu_emulation_per_frame[2],
+      gpu_emulation_per_frame[3], gpu_emulation_per_frame[4], gpu_emulation_per_frame[5],
+      gpu_emulation_per_frame[6], gpu_emulation_per_frame[7]);
 
   if (++s.prof_reports % 6 == 0) {  // every 30 s
     out += ProfReport(s);

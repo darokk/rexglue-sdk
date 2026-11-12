@@ -16,6 +16,21 @@ struct FrameEvents {
   // Reuploads skipped because the data was unchanged (content fingerprints).
   std::atomic<uint64_t> texture_loads_skipped{0};
   std::atomic<uint64_t> upload_bytes_skipped{0};
+  // Texture loads of data the GPU wrote (resolves, memexport).
+  std::atomic<uint64_t> texture_loads_gpu_written{0};
+  // Render target ownership transfers (copies between host render targets
+  // sharing EDRAM): count, EDRAM tiles, and how many have a depth destination.
+  std::atomic<uint64_t> rt_transfers{0};
+  std::atomic<uint64_t> rt_transfer_tiles{0};
+  std::atomic<uint64_t> rt_transfers_to_depth{0};
+  // Transfers into color render targets skipped because the draw overwrites
+  // every pixel they would copy.
+  std::atomic<uint64_t> rt_transfers_skipped{0};
+  // Resolves (EDRAM to memory copies): count, EDRAM tiles dumped from host
+  // render targets for them, and resolve clears.
+  std::atomic<uint64_t> resolves{0};
+  std::atomic<uint64_t> resolve_dump_tiles{0};
+  std::atomic<uint64_t> resolve_clears{0};
   std::atomic<uint64_t> shader_translations{0};
   std::atomic<uint64_t> pipelines_created{0};
 };
