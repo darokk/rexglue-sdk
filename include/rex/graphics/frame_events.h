@@ -35,6 +35,17 @@ struct FrameEvents {
   // textures using the data, and how many of them skipped the copy to memory.
   std::atomic<uint64_t> resolves_direct{0};
   std::atomic<uint64_t> resolves_direct_memory_skipped{0};
+  // Direct3D 9 clears drawn through a 4x view that were applied straight to
+  // the render target holding the memory.
+  std::atomic<uint64_t> clears_forwarded{0};
+  // Draws of the second tile of a frame rendered in two tiles that were
+  // dropped because the first tile's draws covered both (edram_merge_tiles).
+  std::atomic<uint64_t> tile_draws_merged{0};
+  // Draws dropped because something failed (IssueDraw's draw_fail).
+  std::atomic<uint64_t> draw_failures{0};
+  // Texture fetches of draws that got the null texture (no texture could be
+  // made for the fetch constant).
+  std::atomic<uint64_t> missing_textures{0};
   std::atomic<uint64_t> shader_translations{0};
   std::atomic<uint64_t> pipelines_created{0};
 };

@@ -587,6 +587,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
+  // Bottom of the host scissor of the draw being issued when it's a draw of
+  // the first of two merged tiles (0 otherwise) - see
+  // VulkanRenderTargetCache::GetTileMergeDrawAction.
+  uint32_t tile_merge_scissor_bottom_ = 0;
+  // Whether the draw being issued is one of the second of two merged tiles
+  // that has to be drawn without the window offset
+  // (TileMergeAction::kDrawWithoutWindowOffset).
+  bool tile_merge_without_window_offset_ = false;
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};

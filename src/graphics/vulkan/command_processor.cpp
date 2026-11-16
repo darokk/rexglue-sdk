@@ -33,6 +33,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/frame_dump.h>
+#include <rex/graphics/frame_events.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
@@ -68,9 +69,8 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_unused_index_address, true, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_reuse_texture_descriptor_sets, true, "GPU/Vulkan",
                     "Reuse a texture descriptor set written earlier in the submission when a "
                     "draw needs identical contents");
-// On by default: Fable II regenerates its forced readback texture (hero / dog
-// skin) every frame, and waiting for the GPU at each one made the frame rate a
-// third lower on the Steam Deck.
+// Fable II regenerates its forced readback texture every frame. Waiting for
+// each current resolve substantially reduced frame rates on the Steam Deck.
 REXCVAR_DEFINE_BOOL(readback_resolve_force_delayed, true, "GPU",
                     "Read back resolves forced by readback_resolve_force_addresses one resolve "
                     "late (double-buffered, like readback_resolve = fast) instead of waiting for "
@@ -3776,6 +3776,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
         uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
         uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode));
+    CountFrameEvent(g_frame_events.draw_failures);
+    if (g_frame_dump.active) {
+      ++g_frame_dump.frame_draw_failures;
+      const Shader* vs = active_vertex_shader();
+      const Shader* ps = active_pixel_shader();
+      FrameDumpEvent(fmt::format("  DRAW FAILED at {}: prim {} indices {}, vs {:016X} ps {:016X}",
+                                 stage, uint32_t(prim_type), index_count,
+                                 vs ? vs->ucode_data_hash() : 0, ps ? ps->ucode_data_hash() : 0));
+    }
     return false;
   };
 
@@ -4003,6 +4012,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
 
+  // A frame rendered in two tiles: the first tile's draws cover the second
+  // tile's rows as well, and the second tile's draws are dropped.
+  tile_merge_scissor_bottom_ = 0;
+  tile_merge_without_window_offset_ = false;
+  if (is_rasterization_done && !memexport_used_vertex) {
+    switch (render_target_cache_->GetTileMergeDrawAction(frame_current_, bin_select_, bin_mask_,
+                                                         tile_merge_scissor_bottom_)) {
+      case VulkanRenderTargetCache::TileMergeAction::kSkipDraw:
+        CountFrameEvent(g_frame_events.tile_draws_merged);
+        if (g_frame_dump.active) {
+          ++g_frame_dump.frame_tile_draws_merged;
+        }
+        return true;
+      case VulkanRenderTargetCache::TileMergeAction::kDrawWithoutWindowOffset:
+        tile_merge_without_window_offset_ = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  // A Direct3D 9 clear drawn through a 4x view of EDRAM: applied straight to
+  // the render targets holding that memory, without the draw.
+  SetGpuTimeCategory(kGpuTimeRenderTarget);
+  if (render_target_cache_->TryForwardClearThrough4xView(
+          *memory_, *vertex_shader, pixel_shader, normalized_depth_control,
+          normalized_color_mask)) {
+    SetGpuTimeCategory(kGpuTimeDraw);
+    return true;
+  }
+
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
   // submissions must be split) - may perform dispatches and copying.
@@ -4057,6 +4097,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     if (!pipeline_ready) {
       frame_used_async_placeholder_pipeline_ = true;
+      CountFrameEvent(g_frame_events.draw_failures);
+      if (g_frame_dump.active) {
+        ++g_frame_dump.frame_draw_failures;
+        FrameDumpEvent(fmt::format(
+            "  DRAW DROPPED: pipeline not ready, vs {:016X} ps {:016X}",
+            vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0));
+      }
       return true;
     }
     pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
@@ -4123,6 +4170,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // life. Or even disregard the viewport bounds range in the fragment shader
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
+  // A draw of the second of two merged tiles that the first tile didn't
+  // include: the host viewport and scissor are those it would have without the
+  // tile's window offset (the render target cache has seen the real one).
+  const uint32_t window_offset_saved = register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+  if (tile_merge_without_window_offset_) {
+    register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = 0;
+  }
   draw_util::GetHostViewportInfo(
       regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
       device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
@@ -4132,6 +4186,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control, pixel_shader);
+  register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = window_offset_saved;
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -4723,6 +4778,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     readback.memories[index] = new_memory;
     readback.mapped_data[index] = new_mapping;
     readback.sizes[index] = size;
+    readback.submission_written[index] = 0;
+    readback.written_size[index] = 0;
     return true;
   };
 
@@ -4902,39 +4959,37 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   PushBufferMemoryBarrier(readback.buffers[write_index], 0, written_length,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  readback.submission_written[write_index] = GetCurrentSubmission();
+  readback.written_size[write_index] = written_length;
 
   // Reaching here with readback disabled means this resolve was forced by
   // readback_resolve_force_addresses.
   const bool forced = readback_mode == ReadbackResolveMode::kDisabled;
-  bool use_delayed_sync =
+  const bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome ||
       (forced && REXCVAR_GET(readback_resolve_force_delayed));
-  uint32_t read_index = write_index;
-  if (use_delayed_sync) {
-    read_index = 1 - write_index;
-  } else {
-    const auto resolve_wait_start = std::chrono::steady_clock::now();
-    const bool resolve_awaited = AwaitAllQueueOperationsCompletion();
-    NoteGpuSync(GpuSyncKind::kResolveReadback, resolve_wait_start);
-    if (!resolve_awaited) {
+  const uint32_t previous_index = 1 - write_index;
+  const bool previous_valid = readback.submission_written[previous_index] != 0 &&
+                              readback.written_size[previous_index] == written_length;
+  if (readback_mode != ReadbackResolveMode::kSome || !previous_valid) {
+    const uint32_t read_index = use_delayed_sync && previous_valid ? previous_index : write_index;
+    const uint64_t read_submission = readback.submission_written[read_index];
+    if (read_submission >= GetCurrentSubmission()) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      const bool completed = AwaitAllQueueOperationsCompletion();
+      NoteGpuSync(GpuSyncKind::kResolveReadback, wait_start);
+      if (!completed) {
+        return true;
+      }
+    } else if (read_submission > GetCompletedSubmission()) {
+      // Async submission can leave the previous copy in flight.
+      const auto wait_start = std::chrono::steady_clock::now();
+      CheckSubmissionFenceAndDeviceLoss(read_submission);
+      NoteGpuSync(GpuSyncKind::kResolveReadback, wait_start);
+    }
+    if (read_submission > GetCompletedSubmission()) {
       return true;
     }
-  }
-
-  bool is_cache_miss = false;
-  if (use_delayed_sync && (readback.buffers[read_index] == VK_NULL_HANDLE ||
-                           written_length > readback.sizes[read_index] ||
-                           readback.mapped_data[read_index] == nullptr)) {
-    is_cache_miss = true;
-    read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
-      return true;
-    }
-  }
-
-  bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
-  if (should_copy && readback.buffers[read_index] != VK_NULL_HANDLE &&
-      written_length <= readback.sizes[read_index] && readback.mapped_data[read_index] != nullptr) {
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     readback_memory_range.memory = readback.memories[read_index];
@@ -6326,6 +6381,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   // Scissor.
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  if (tile_merge_scissor_bottom_ > scissor.offset[1] + scissor.extent[1]) {
+    // The first of two merged tiles: down to the bottom of the frame.
+    scissor.extent[1] = tile_merge_scissor_bottom_ - scissor.offset[1];
+  }
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;

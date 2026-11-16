@@ -22,6 +22,8 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_dump.h>
+#include <rex/graphics/frame_events.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -583,6 +585,34 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   }
 
   TextureCache::RequestTextures(used_texture_mask);
+
+  // Fetches that get the null texture (shown black or transparent).
+  {
+    uint32_t used_remaining = used_texture_mask;
+    uint32_t used_index;
+    while (rex::bit_scan_forward(used_remaining, &used_index)) {
+      used_remaining &= ~(uint32_t(1) << used_index);
+      if (IsActiveTextureBindingValid(used_index)) {
+        continue;
+      }
+      CountFrameEvent(g_frame_events.missing_textures);
+      if (g_frame_dump.active) {
+        ++g_frame_dump.frame_missing_textures;
+        const xenos::xe_gpu_texture_fetch_t fetch = register_file().GetTextureFetch(used_index);
+        FrameDumpEvent(fmt::format(
+            "  NULL TEXTURE for tf{}: fetch type {} format {} {}x{} dimension {} base {:08X} "
+            "mips {:08X} tiled {} signs {:03o} (dwords {:08X} {:08X} {:08X} {:08X} {:08X} "
+            "{:08X})",
+            used_index, uint32_t(fetch.type), uint32_t(fetch.format),
+            uint32_t(fetch.size_2d.width) + 1, uint32_t(fetch.size_2d.height) + 1,
+            uint32_t(fetch.dimension), uint32_t(fetch.base_address) << 12,
+            uint32_t(fetch.mip_address) << 12, uint32_t(fetch.tiled),
+            uint32_t(fetch.sign_x) | (uint32_t(fetch.sign_y) << 3) | (uint32_t(fetch.sign_z) << 6),
+            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5));
+      }
+    }
+  }
 
   // Pre-create 3D-as-2D wrappers while still in texture request phase.
   if (REXCVAR_GET(gpu_3d_to_2d_texture)) {

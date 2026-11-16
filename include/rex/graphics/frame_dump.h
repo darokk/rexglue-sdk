@@ -40,6 +40,10 @@ struct FrameDump {
   uint32_t frame_resolves = 0;
   uint32_t frame_direct_resolves = 0;
   uint32_t frame_texture_loads = 0;
+  uint32_t frame_clears_forwarded = 0;
+  uint32_t frame_tile_draws_merged = 0;
+  uint32_t frame_draw_failures = 0;
+  uint32_t frame_missing_textures = 0;
   // Capture scheduling.
   uint32_t captures = 0;
   double next_capture_time = 0.0;

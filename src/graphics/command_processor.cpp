@@ -1304,7 +1304,7 @@ struct HostPerfState {
   uint64_t texture_loads_skipped_reported = 0;
   uint64_t upload_bytes_skipped_reported = 0;
   // EDRAM emulation counters of the "EDRAM per frame" line.
-  uint64_t gpu_emulation_reported[10] = {};
+  uint64_t gpu_emulation_reported[14] = {};
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1638,7 +1638,7 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
 
   // EDRAM emulation work: render target ownership transfers, resolves, and
   // texture loads of GPU-written data.
-  const uint64_t gpu_emulation[10] = {
+  const uint64_t gpu_emulation[14] = {
       g_frame_events.rt_transfers.load(std::memory_order_relaxed),
       g_frame_events.rt_transfer_tiles.load(std::memory_order_relaxed),
       g_frame_events.rt_transfers_to_depth.load(std::memory_order_relaxed),
@@ -1648,20 +1648,26 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       g_frame_events.resolve_clears.load(std::memory_order_relaxed),
       g_frame_events.texture_loads_gpu_written.load(std::memory_order_relaxed),
       g_frame_events.resolves_direct.load(std::memory_order_relaxed),
-      g_frame_events.resolves_direct_memory_skipped.load(std::memory_order_relaxed)};
-  uint64_t gpu_emulation_per_frame[10];
-  for (int i = 0; i < 10; ++i) {
+      g_frame_events.resolves_direct_memory_skipped.load(std::memory_order_relaxed),
+      g_frame_events.clears_forwarded.load(std::memory_order_relaxed),
+      g_frame_events.tile_draws_merged.load(std::memory_order_relaxed),
+      g_frame_events.draw_failures.load(std::memory_order_relaxed),
+      g_frame_events.missing_textures.load(std::memory_order_relaxed)};
+  uint64_t gpu_emulation_per_frame[14];
+  for (int i = 0; i < 14; ++i) {
     gpu_emulation_per_frame[i] = per_frame(gpu_emulation[i], s.gpu_emulation_reported[i]);
     s.gpu_emulation_reported[i] = gpu_emulation[i];
   }
   out += fmt::format(
       "\n         EDRAM per frame: {} render target copies ({} tiles, {} to depth; +{} "
       "skipped), {} resolves ({} tiles dumped; {} direct to texture, {} of those without the "
-      "memory copy), {} resolve clears, {} texture loads of GPU-written data",
+      "memory copy), {} resolve clears, {} clears forwarded, {} second-tile draws merged, {} "
+      "texture loads of GPU-written data; {} failed draws, {} null-texture fetches",
       gpu_emulation_per_frame[0], gpu_emulation_per_frame[1], gpu_emulation_per_frame[2],
       gpu_emulation_per_frame[3], gpu_emulation_per_frame[4], gpu_emulation_per_frame[5],
       gpu_emulation_per_frame[8], gpu_emulation_per_frame[9], gpu_emulation_per_frame[6],
-      gpu_emulation_per_frame[7]);
+      gpu_emulation_per_frame[10], gpu_emulation_per_frame[11], gpu_emulation_per_frame[7],
+      gpu_emulation_per_frame[12], gpu_emulation_per_frame[13]);
 
   if (++s.prof_reports % 6 == 0) {  // every 30 s
     out += ProfReport(s);
@@ -1740,11 +1746,15 @@ void FrameDumpOnSwap() {
       char stamp[16];
       std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&t));
       std::fprintf(file,
-                   "===== frame dump %u at %s: %u draws, %u transfers (+%u skipped), %u resolves "
-                   "(%u direct to texture), %u texture loads of GPU-written data =====\n",
-                   d.captures + 1, stamp, d.frame_draws, d.frame_transfers,
-                   d.frame_transfers_skipped, d.frame_resolves, d.frame_direct_resolves,
-                   d.frame_texture_loads);
+                   "===== frame dump %u at %s: %u draws (+%u second-tile draws merged), %u "
+                   "transfers (+%u skipped), %u clears forwarded, %u resolves (%u direct to "
+                   "texture), %u texture loads of GPU-written data, %u failed draws, %u "
+                   "null-texture fetches =====\n",
+                   d.captures + 1, stamp, d.frame_draws, d.frame_tile_draws_merged,
+                   d.frame_transfers, d.frame_transfers_skipped, d.frame_clears_forwarded,
+                   d.frame_resolves,
+                   d.frame_direct_resolves,
+                   d.frame_texture_loads, d.frame_draw_failures, d.frame_missing_textures);
       std::fwrite(d.text.data(), 1, d.text.size(), file);
       std::fputc('\n', file);
       std::fclose(file);
@@ -1763,7 +1773,8 @@ void FrameDumpOnSwap() {
     d.next_capture_time = now + 20.0;
     d.active = true;
     d.frame_draws = d.frame_transfers = d.frame_transfers_skipped = d.frame_resolves =
-        d.frame_direct_resolves = d.frame_texture_loads = 0;
+        d.frame_direct_resolves = d.frame_texture_loads = d.frame_clears_forwarded =
+            d.frame_tile_draws_merged = d.frame_draw_failures = d.frame_missing_textures = 0;
     d.text.reserve(1 << 18);
   }
 }
