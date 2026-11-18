@@ -690,6 +690,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::deque<std::pair<uint64_t, uint32_t>> gpu_timestamp_pending_;
   uint64_t gpu_category_ns_[kGpuTimeCategoryCount] = {};
   uint32_t gpu_time_category_ = kGpuTimeOther;
+  // log_perf_gpu_passes: plain draws split by the render targets they draw to
+  // (EDRAM layout key), as extra timestamp categories from kGpuTimePassFirst.
+  // The last slot takes every layout beyond the others.
+  static constexpr uint32_t kGpuTimePassFirst = 16;
+  static constexpr uint32_t kGpuTimePassSlots = 40;
+  uint32_t GetGpuTimePassCategory(uint32_t normalized_color_mask,
+                                  reg::RB_DEPTHCONTROL normalized_depth_control);
+  uint64_t gpu_pass_keys_[kGpuTimePassSlots] = {};
+  uint32_t gpu_pass_slots_used_ = 0;
+  uint32_t gpu_pass_last_slot_ = UINT32_MAX;
+  uint64_t gpu_pass_draws_[kGpuTimePassSlots] = {};
+  uint64_t gpu_pass_ns_[kGpuTimePassSlots] = {};
   // Commands recorded while no submission is open (discarded, as before).
   std::unique_ptr<DeferredCommandBuffer> closed_command_buffer_;
   DeferredCommandBuffer* deferred_command_buffer_ = nullptr;

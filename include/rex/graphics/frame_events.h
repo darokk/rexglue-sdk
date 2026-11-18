@@ -41,6 +41,11 @@ struct FrameEvents {
   // Draws of the second tile of a frame rendered in two tiles that were
   // dropped because the first tile's draws covered both (edram_merge_tiles).
   std::atomic<uint64_t> tile_draws_merged{0};
+  // Memexport draws whose output the CPU computed: not run on the GPU at all
+  // (memexport_skip_cpu_computed), or run anyway (they also rasterize, or the
+  // CPU output doesn't cover their exports).
+  std::atomic<uint64_t> memexport_draws_skipped{0};
+  std::atomic<uint64_t> memexport_draws_cpu_kept{0};
   // Draws dropped because something failed (IssueDraw's draw_fail).
   std::atomic<uint64_t> draw_failures{0};
   // Texture fetches of draws that got the null texture (no texture could be

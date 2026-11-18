@@ -693,6 +693,11 @@ bool VulkanTextureCache::IsDirectResolveFormat(xenos::TextureFormat format) cons
       return direct_resolve_blit_to_2101010_supported_;
     case xenos::TextureFormat::k_1_5_5_5:
       return direct_resolve_blit_to_1555_supported_;
+    // Written by the render target cache's conversion shader, then copied
+    // (resolve_direct_hdr_depth).
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+    case xenos::TextureFormat::k_24_8_FLOAT:
+      return true;
     default:
       return false;
   }
@@ -746,6 +751,13 @@ bool VulkanTextureCache::PrepareDirectResolve(const draw_util::ResolveInfo& reso
     case xenos::ColorFormat::k_1_5_5_5:
       texture_format = xenos::TextureFormat::k_1_5_5_5;
       break;
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+      texture_format = xenos::TextureFormat::k_16_16_16_16_FLOAT;
+      break;
+    // Depth resolves store their (unnamed in ColorFormat) depth format, 23.
+    case static_cast<xenos::ColorFormat>(uint32_t(xenos::TextureFormat::k_24_8_FLOAT)):
+      texture_format = xenos::TextureFormat::k_24_8_FLOAT;
+      break;
     default:
       return false;
   }
@@ -763,14 +775,45 @@ bool VulkanTextureCache::PrepareDirectResolve(const draw_util::ResolveInfo& reso
                           << xenos::kResolveAlignmentPixelsLog2;
   const uint32_t dest_pitch =
       uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5;
-  auto candidates_it =
-      direct_resolve_candidates_.find((resolve_info.copy_dest_base & 0x1FFFFFFF) >> 12);
-  if (candidates_it == direct_resolve_candidates_.end()) {
-    return false;
-  }
   const uint32_t bytes_per_texel =
       FormatInfo::Get(texture_format)->bits_per_pixel / 8;
-  for (const std::pair<VulkanTexture*, uint32_t>& candidate : candidates_it->second) {
+  // Textures made of the destination, or, with none there, the base level of
+  // the textures the previous direct resolve wrote, if the destination is a
+  // row further down in them (tile rows of 32 for tiled textures).
+  std::vector<std::pair<VulkanTexture*, uint32_t>> continued;
+  uint32_t continued_rows = 0;
+  const std::vector<std::pair<VulkanTexture*, uint32_t>>* candidates = nullptr;
+  auto candidates_it =
+      direct_resolve_candidates_.find((resolve_info.copy_dest_base & 0x1FFFFFFF) >> 12);
+  if (candidates_it != direct_resolve_candidates_.end()) {
+    candidates = &candidates_it->second;
+  } else {
+    const uint32_t dest_address = resolve_info.copy_dest_base & 0x1FFFFFFF;
+    for (const DirectResolveTarget& last : direct_resolve_last_targets_) {
+      if (last.level) {
+        continue;
+      }
+      const TextureKey key = last.texture->key();
+      const uint32_t base_address = uint32_t(key.base_page) << 12;
+      const uint32_t row_pitch = last.texture->guest_layout().base.row_pitch_bytes;
+      const uint32_t row_group = row_pitch * (key.tiled ? 32 : 1);
+      if (!row_group || dest_address <= base_address ||
+          (dest_address - base_address) % row_group) {
+        continue;
+      }
+      const uint32_t rows = (dest_address - base_address) / row_pitch;
+      if (rows >= key.GetHeight() || (!continued.empty() && rows != continued_rows)) {
+        continue;
+      }
+      continued_rows = rows;
+      continued.emplace_back(last.texture, 0);
+    }
+    if (continued.empty()) {
+      return false;
+    }
+    candidates = &continued;
+  }
+  for (const std::pair<VulkanTexture*, uint32_t>& candidate : *candidates) {
     VulkanTexture* texture = candidate.first;
     const uint32_t level = candidate.second;
     const TextureKey key = texture->key();
@@ -779,21 +822,22 @@ bool VulkanTextureCache::PrepareDirectResolve(const draw_util::ResolveInfo& reso
         level ? layout.mips[level] : layout.base;
     const uint32_t level_width = std::max(key.GetWidth() >> level, uint32_t(1));
     const uint32_t level_height = std::max(key.GetHeight() >> level, uint32_t(1));
+    const uint32_t target_y = dest_y + continued_rows;
     if (key.format != texture_format ||
         uint32_t(key.endianness) != uint32_t(dest_info.copy_dest_endian) ||
         level_layout.row_pitch_bytes != dest_pitch * bytes_per_texel || dest_x >= level_width ||
-        dest_y >= level_height) {
+        target_y >= level_height) {
       continue;
     }
     DirectResolveTarget target;
     target.texture = texture;
     target.level = level;
     target.x = dest_x;
-    target.y = dest_y;
+    target.y = target_y;
     target.width = std::min(width, level_width - dest_x);
-    target.height = std::min(height, level_height - dest_y);
+    target.height = std::min(height, level_height - target_y);
     const bool whole_level =
-        !dest_x && !dest_y && target.width == level_width && target.height == level_height;
+        !dest_x && !target_y && target.width == level_width && target.height == level_height;
     if (key.mip_max_level) {
       // One level of several: the others must hold valid data. Red and blue
       // are exchanged (or not) for the whole image; a resolve of the whole
@@ -893,6 +937,7 @@ void VulkanTextureCache::CommitDirectResolve(const draw_util::ResolveInfo& resol
   if (views_changed) {
     ResetTextureBindings();
   }
+  direct_resolve_last_targets_ = direct_resolve_targets_;
 }
 
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
@@ -2166,6 +2211,15 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cac
 }
 
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+  {
+    VulkanTextureCache& cache = static_cast<VulkanTextureCache&>(texture_cache());
+    auto& last = cache.direct_resolve_last_targets_;
+    last.erase(std::remove_if(last.begin(), last.end(),
+                              [this](const DirectResolveTarget& target) {
+                                return target.texture == this;
+                              }),
+               last.end());
+  }
   if (direct_resolve_candidate_) {
     VulkanTextureCache& cache = static_cast<VulkanTextureCache&>(texture_cache());
     std::vector<std::pair<uint32_t, uint32_t>> direct_levels;

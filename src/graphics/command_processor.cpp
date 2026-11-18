@@ -1286,6 +1286,10 @@ struct HostPerfState {
   std::string gpu_dir;   // /sys/class/drm/cardN/device
   uint64_t gpu_busy_sum = 0;
   uint32_t gpu_busy_samples = 0;
+  // amdgpu hwmon power1_average (microwatts; the whole APU on the Steam Deck).
+  int power_fd = -1;
+  uint64_t power_sum = 0;
+  uint32_t power_samples = 0;
   std::unordered_map<int, uint64_t> prev_ticks;  // tid -> utime + stime
   std::FILE* file = nullptr;
   bool file_failed = false;
@@ -1304,7 +1308,7 @@ struct HostPerfState {
   uint64_t texture_loads_skipped_reported = 0;
   uint64_t upload_bytes_skipped_reported = 0;
   // EDRAM emulation counters of the "EDRAM per frame" line.
-  uint64_t gpu_emulation_reported[14] = {};
+  uint64_t gpu_emulation_reported[16] = {};
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1494,7 +1498,20 @@ void CommandProcessor::HostPerfSampleFrame() {
       if (fd >= 0) {
         s.gpu_busy_fd = fd;
         s.gpu_dir = dir;
+        for (int h = 0; h < 16 && s.power_fd < 0; ++h) {
+          s.power_fd = ::open(fmt::format("{}/hwmon/hwmon{}/power1_average", dir, h).c_str(),
+                              O_RDONLY | O_CLOEXEC);
+        }
       }
+    }
+  }
+  if (s.power_fd >= 0) {
+    char power_buf[24];
+    const ssize_t power_n = ::pread(s.power_fd, power_buf, sizeof(power_buf) - 1, 0);
+    if (power_n > 0) {
+      power_buf[power_n] = 0;
+      s.power_sum += uint64_t(std::strtoull(power_buf, nullptr, 10));
+      ++s.power_samples;
     }
   }
   if (s.gpu_busy_fd < 0) return;
@@ -1590,6 +1607,11 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
   }
   s.gpu_busy_sum = 0;
   s.gpu_busy_samples = 0;
+  if (s.power_samples) {
+    out += fmt::format("; APU {:.1f} W", double(s.power_sum) / double(s.power_samples) / 1e6);
+  }
+  s.power_sum = 0;
+  s.power_samples = 0;
 
   // Host work per guest frame since the last report.
   const double frames = std::max(1.0, double(fps_log_frames_));
@@ -1629,6 +1651,26 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       per_frame(texture_loads_skipped, s.texture_loads_skipped_reported),
       per_frame(upload_bytes, s.upload_bytes_reported) / 1024,
       per_frame(upload_bytes_skipped, s.upload_bytes_skipped_reported) / 1024);
+  {
+    // Which threads take the write-watch faults, and on which guest pages.
+    const rex::memory::WatchFaultDetail faults = rex::memory::TakeWatchFaultDetail();
+    if (!faults.threads.empty()) {
+      out += "\n         watch faults per frame by thread:";
+      for (size_t i = 0; i < faults.threads.size() && i < 6; ++i) {
+        std::string name = ReadSmallFile(
+            fmt::format("/proc/self/task/{}/comm", faults.threads[i].first));
+        while (!name.empty() && (name.back() == '\n' || name.back() == ' ')) name.pop_back();
+        out += fmt::format("{} {} {:.1f}", i ? "," : "", name.empty() ? "?" : name,
+                           double(faults.threads[i].second) / frames);
+      }
+      out += "; hottest pages:";
+      for (size_t i = 0; i < faults.pages.size() && i < 8; ++i) {
+        out += fmt::format(" {:08X} {:.1f}", faults.pages[i].first,
+                           double(faults.pages[i].second) / frames);
+      }
+      out += fmt::format(" ({} pages)", faults.pages.size());
+    }
+  }
   work_stats_reported_ = work_stats_;
   s.protect_reported = protect;
   s.texture_loads_reported = texture_loads;
@@ -1638,7 +1680,7 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
 
   // EDRAM emulation work: render target ownership transfers, resolves, and
   // texture loads of GPU-written data.
-  const uint64_t gpu_emulation[14] = {
+  const uint64_t gpu_emulation[16] = {
       g_frame_events.rt_transfers.load(std::memory_order_relaxed),
       g_frame_events.rt_transfer_tiles.load(std::memory_order_relaxed),
       g_frame_events.rt_transfers_to_depth.load(std::memory_order_relaxed),
@@ -1652,9 +1694,11 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       g_frame_events.clears_forwarded.load(std::memory_order_relaxed),
       g_frame_events.tile_draws_merged.load(std::memory_order_relaxed),
       g_frame_events.draw_failures.load(std::memory_order_relaxed),
-      g_frame_events.missing_textures.load(std::memory_order_relaxed)};
-  uint64_t gpu_emulation_per_frame[14];
-  for (int i = 0; i < 14; ++i) {
+      g_frame_events.missing_textures.load(std::memory_order_relaxed),
+      g_frame_events.memexport_draws_skipped.load(std::memory_order_relaxed),
+      g_frame_events.memexport_draws_cpu_kept.load(std::memory_order_relaxed)};
+  uint64_t gpu_emulation_per_frame[16];
+  for (int i = 0; i < 16; ++i) {
     gpu_emulation_per_frame[i] = per_frame(gpu_emulation[i], s.gpu_emulation_reported[i]);
     s.gpu_emulation_reported[i] = gpu_emulation[i];
   }
@@ -1662,12 +1706,14 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       "\n         EDRAM per frame: {} render target copies ({} tiles, {} to depth; +{} "
       "skipped), {} resolves ({} tiles dumped; {} direct to texture, {} of those without the "
       "memory copy), {} resolve clears, {} clears forwarded, {} second-tile draws merged, {} "
-      "texture loads of GPU-written data; {} failed draws, {} null-texture fetches",
+      "texture loads of GPU-written data; {} failed draws, {} null-texture fetches; "
+      "CPU-computed memexport draws: {} skipped, {} run",
       gpu_emulation_per_frame[0], gpu_emulation_per_frame[1], gpu_emulation_per_frame[2],
       gpu_emulation_per_frame[3], gpu_emulation_per_frame[4], gpu_emulation_per_frame[5],
       gpu_emulation_per_frame[8], gpu_emulation_per_frame[9], gpu_emulation_per_frame[6],
       gpu_emulation_per_frame[10], gpu_emulation_per_frame[11], gpu_emulation_per_frame[7],
-      gpu_emulation_per_frame[12], gpu_emulation_per_frame[13]);
+      gpu_emulation_per_frame[12], gpu_emulation_per_frame[13], gpu_emulation_per_frame[14],
+      gpu_emulation_per_frame[15]);
 
   if (++s.prof_reports % 6 == 0) {  // every 30 s
     out += ProfReport(s);

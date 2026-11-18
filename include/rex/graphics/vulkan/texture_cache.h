@@ -490,6 +490,10 @@ class VulkanTextureCache final : public TextureCache {
   std::vector<std::pair<Texture*, bool>> direct_resolve_watchers_;
   std::vector<DirectResolveTarget> direct_resolve_targets_;
   bool direct_resolve_rb_swap_ = false;
+  // The targets of the last committed direct resolve: a resolve to memory
+  // further down in the same texture (the second tile of a frame drawn in two
+  // tiles) has no texture of its own at its address, and continues these.
+  std::vector<DirectResolveTarget> direct_resolve_last_targets_;
   // A texture loaded from memory had red and blue exchanged by an earlier
   // direct resolve: its views changed, so the bindings must be made again.
   bool direct_resolve_rebind_needed_ = false;

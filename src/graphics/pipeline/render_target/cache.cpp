@@ -937,7 +937,7 @@ void RenderTargetCache::GetResolveCopyDispatchesToDump(
 bool RenderTargetCache::FindClearThrough4xViewTarget(
     uint32_t view_base_tiles, uint32_t view_pitch_tiles, uint32_t left, uint32_t top,
     uint32_t right, uint32_t bottom, RenderTargetKey& target_key_out,
-    Transfer::Rectangle& rectangle_out) const {
+    Transfer::Rectangle& rectangle_out, bool fallback_is_depth, int32_t fallback_format) const {
   if (GetPath() != Path::kHostRenderTargets || !view_pitch_tiles || left >= right ||
       top >= bottom) {
     return false;
@@ -956,11 +956,60 @@ bool RenderTargetCache::FindClearThrough4xViewTarget(
     return false;
   }
   --it;
-  const RenderTargetKey owner = it->second.render_target;
-  if (owner.IsEmpty() || owner.msaa_samples >= xenos::MsaaSamples::k4X || owner.Is64bpp() ||
-      owner.pitch_tiles_at_32bpp != view_pitch_tiles || owner.base_tiles > view_base_tiles ||
-      (view_base_tiles - owner.base_tiles) % view_pitch_tiles) {
-    return false;
+  auto usable = [&](const RenderTargetKey& key) {
+    return !key.IsEmpty() && key.msaa_samples < xenos::MsaaSamples::k4X && !key.Is64bpp() &&
+           key.pitch_tiles_at_32bpp == view_pitch_tiles && key.base_tiles <= view_base_tiles &&
+           !((view_base_tiles - key.base_tiles) % view_pitch_tiles);
+  };
+  RenderTargetKey owner = it->second.render_target;
+  if (!usable(owner)) {
+    // Typically the memory last held a 64bpp target or another 4x view; clear
+    // into the target that has the view's layout apart from the sample count.
+    if (fallback_format < 0) {
+      return false;
+    }
+    owner = RenderTargetKey();
+    for (xenos::MsaaSamples samples : {xenos::MsaaSamples::k1X, xenos::MsaaSamples::k2X}) {
+      RenderTargetKey key;
+      key.base_tiles = view_base_tiles;
+      key.pitch_tiles_at_32bpp = view_pitch_tiles;
+      key.msaa_samples = samples;
+      key.is_depth = uint32_t(fallback_is_depth);
+      key.resource_format = uint32_t(fallback_format);
+      auto found = render_targets_.find(key);
+      if (found != render_targets_.end() && found->second && usable(key)) {
+        owner = key;
+        break;
+      }
+    }
+    if (owner.IsEmpty() && fallback_is_depth) {
+      // No depth target there: memory a depth clear prepares is often used as
+      // color next (Direct3D 9 clears color surfaces through depth views too);
+      // the value is the same 32 bits in either.
+      for (xenos::ColorRenderTargetFormat color_format :
+           {xenos::ColorRenderTargetFormat::k_8_8_8_8, xenos::ColorRenderTargetFormat::k_2_10_10_10,
+            xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT}) {
+        for (xenos::MsaaSamples samples : {xenos::MsaaSamples::k1X, xenos::MsaaSamples::k2X}) {
+          RenderTargetKey key;
+          key.base_tiles = view_base_tiles;
+          key.pitch_tiles_at_32bpp = view_pitch_tiles;
+          key.msaa_samples = samples;
+          key.is_depth = 0;
+          key.resource_format = uint32_t(GetColorResourceFormat(color_format));
+          auto found = render_targets_.find(key);
+          if (found != render_targets_.end() && found->second && usable(key)) {
+            owner = key;
+            break;
+          }
+        }
+        if (!owner.IsEmpty()) {
+          break;
+        }
+      }
+    }
+    if (owner.IsEmpty()) {
+      return false;
+    }
   }
   const uint32_t y_scale_log2 = uint32_t(owner.msaa_samples == xenos::MsaaSamples::k1X);
   const uint32_t owner_tile_height =

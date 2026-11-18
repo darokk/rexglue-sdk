@@ -18,6 +18,8 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/platform.h>
@@ -117,7 +119,16 @@ struct ProtectStats {
   uint64_t watch_faults;
 };
 ProtectStats GetProtectStats();
-void NoteWatchFault();
+// Called from the fault handler (async-signal-safe): counts the fault, and by
+// thread and guest page for TakeWatchFaultDetail.
+void NoteWatchFault(uint32_t guest_address);
+// Watch faults since the last call, by thread (Linux thread id, count) and by
+// guest page (page address, count), each sorted by count, most first.
+struct WatchFaultDetail {
+  std::vector<std::pair<int, uint64_t>> threads;
+  std::vector<std::pair<uint32_t, uint64_t>> pages;
+};
+WatchFaultDetail TakeWatchFaultDetail();
 // Writes the runtime library's PGO profile counters (rex/pgo.h); false when
 // it's not an instrumented build.
 bool WriteRuntimeProfile();

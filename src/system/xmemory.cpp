@@ -565,7 +565,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
                                       is_write, false)) {
 #if !REX_PLATFORM_WIN32
-    rex::memory::NoteWatchFault();
+    rex::memory::NoteWatchFault(virtual_address);
 #endif
     return true;
   }

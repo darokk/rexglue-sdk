@@ -934,6 +934,39 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     bool first_tile_resolved = false;
   };
   TileMerge tile_merge_;
+
+  // resolve_direct_hdr_depth: a compute shader converts the render target the
+  // way the path through EDRAM and memory would (2:10:10:10 float samples
+  // quantized to 7e3 and averaged; depth encoded as 20e4 and decoded again)
+  // into a scratch image, which the texture cache copies into the textures.
+  enum DirectConvertMode : uint32_t { kDirectConvertHdr, kDirectConvertDepth };
+  static constexpr uint32_t kDirectConvertImageSize = 1280;
+  bool EnsureDirectConvertLayouts();
+  VkPipeline GetDirectConvertPipeline(uint32_t mode, bool multisampled);
+  bool EnsureDirectConvertImage(uint32_t mode);
+  // Records the conversion of width x height pixels at source_x, source_y;
+  // host_sample_1 < 0 for one sample. Returns the scratch image (in the
+  // transfer source layout, its barrier pending), or VK_NULL_HANDLE.
+  VkImage RunDirectConvert(uint32_t mode, VulkanRenderTarget& source, int32_t source_x,
+                           int32_t source_y, uint32_t width, uint32_t height,
+                           int32_t host_sample_0, int32_t host_sample_1);
+  void DestroyDirectConvertResources();
+  VkDescriptorSetLayout direct_convert_storage_layout_ = VK_NULL_HANDLE;
+  VkDescriptorPool direct_convert_descriptor_pool_ = VK_NULL_HANDLE;
+  VkPipelineLayout direct_convert_pipeline_layouts_[2] = {};
+  VkPipeline direct_convert_pipelines_[2][2] = {};
+  bool direct_convert_pipeline_failed_[2][2] = {};
+  bool direct_convert_layouts_failed_ = false;
+  struct DirectConvertImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    bool failed = false;
+    // VK_IMAGE_LAYOUT_UNDEFINED before the first use.
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  };
+  DirectConvertImage direct_convert_images_[2];
   // What identifies the surfaces of the tiles in the current registers: pitch
   // and sample count, and the EDRAM base and host render target format of
   // color 0 and of depth. Not the raw register values: the game switches

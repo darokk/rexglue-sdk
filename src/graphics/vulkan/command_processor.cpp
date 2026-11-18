@@ -92,6 +92,25 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport_per_occurrence, true, "GPU/Vulkan"
                     "readback, which stalls the GPU thread for the whole frame so far")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(log_perf_gpu_passes, false, "GPU/Vulkan",
+                    "With log_perf_file, also split the GPU time of plain draws by the "
+                    "render targets they draw to (pitch, samples, color 0 and depth "
+                    "format), into the performance log")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(edram_merge_tiles_early, true, "GPU/Vulkan",
+                    "With edram_merge_tiles, decide whether a second-tile draw is dropped "
+                    "before the draw is set up (primitive processing, shaders, textures, "
+                    "samplers), so dropped draws cost almost nothing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(memexport_skip_cpu_computed, true, "GPU/Vulkan",
+                    "Don't run memexport-only draws whose whole output the CPU has already "
+                    "written to guest memory (Fable II's terrain tessellation and skinning "
+                    "with terrain_tess_cpu / skinning_cpu); the draws reading that output "
+                    "upload it from guest memory instead")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
@@ -3808,10 +3827,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   // These memexport shaders only read data the CPU wrote, so the CPU can give the
-  // guest their output directly. The draw still runs, only the wait to read the
-  // result back is skipped.
-  const bool memexport_computed_on_cpu =
-      fable2::ComputeMemexportOnCpu(*register_file_, *memory_, *vertex_shader);
+  // guest their output directly. The wait to read the result back is skipped,
+  // and the draw itself too if that's all it does (memexport_skip_cpu_computed,
+  // below).
+  uint32_t memexport_cpu_start = 0, memexport_cpu_length = 0;
+  const bool memexport_computed_on_cpu = fable2::ComputeMemexportOnCpu(
+      *register_file_, *memory_, *vertex_shader, &memexport_cpu_start, &memexport_cpu_length);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -3826,6 +3847,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Pixel shader analysis.
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
   bool is_rasterization_done = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+  // A memexport-only draw whose whole output the CPU has written: running it
+  // would only write the same bytes again. The CPU wrote through the physical
+  // mapping, which doesn't trigger the write watches, so the GPU's copy of the
+  // range is invalidated here instead; the draws that read the output upload
+  // the CPU's result.
+  if (memexport_computed_on_cpu && !is_rasterization_done && memexport_cpu_length &&
+      !memexport_ranges_.empty() && REXCVAR_GET(memexport_skip_cpu_computed)) {
+    const uint64_t cpu_end = uint64_t(memexport_cpu_start) + memexport_cpu_length;
+    bool covered = true;
+    for (const draw_util::MemExportRange& range : memexport_ranges_) {
+      const uint64_t start = uint64_t(range.base_address_dwords) << 2;
+      if (start < memexport_cpu_start || start + range.size_bytes > cpu_end) {
+        covered = false;
+        break;
+      }
+    }
+    if (covered) {
+      shared_memory_->MemoryInvalidationCallback(memexport_cpu_start, memexport_cpu_length, true);
+      CountFrameEvent(g_frame_events.memexport_draws_skipped);
+      memexport_ranges_.clear();
+      return true;
+    }
+  }
+  if (memexport_computed_on_cpu) {
+    CountFrameEvent(g_frame_events.memexport_draws_cpu_kept);
+  }
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
@@ -3878,6 +3925,40 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+
+  // A frame rendered in two tiles: the first tile's draws cover the second
+  // tile's rows as well, and the second tile's draws are dropped. The decision
+  // only depends on registers and the tile merge state. Returns false for a
+  // dropped draw.
+  auto apply_tile_merge = [&]() -> bool {
+    tile_merge_scissor_bottom_ = 0;
+    tile_merge_without_window_offset_ = false;
+    if (!is_rasterization_done || memexport_used_vertex) {
+      return true;
+    }
+    switch (render_target_cache_->GetTileMergeDrawAction(frame_current_, bin_select_, bin_mask_,
+                                                         tile_merge_scissor_bottom_)) {
+      case VulkanRenderTargetCache::TileMergeAction::kSkipDraw:
+        CountFrameEvent(g_frame_events.tile_draws_merged);
+        if (g_frame_dump.active) {
+          ++g_frame_dump.frame_tile_draws_merged;
+        }
+        return false;
+      case VulkanRenderTargetCache::TileMergeAction::kDrawWithoutWindowOffset:
+        tile_merge_without_window_offset_ = true;
+        break;
+      default:
+        break;
+    }
+    return true;
+  };
+  // Decided before the draw is set up (edram_merge_tiles_early), so a dropped
+  // draw costs no primitive processing, shader translation, texture or sampler
+  // work; otherwise just before the render targets are updated.
+  const bool tile_merge_early = REXCVAR_GET(edram_merge_tiles_early);
+  if (tile_merge_early && !apply_tile_merge()) {
+    return true;
+  }
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -4012,25 +4093,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
 
-  // A frame rendered in two tiles: the first tile's draws cover the second
-  // tile's rows as well, and the second tile's draws are dropped.
-  tile_merge_scissor_bottom_ = 0;
-  tile_merge_without_window_offset_ = false;
-  if (is_rasterization_done && !memexport_used_vertex) {
-    switch (render_target_cache_->GetTileMergeDrawAction(frame_current_, bin_select_, bin_mask_,
-                                                         tile_merge_scissor_bottom_)) {
-      case VulkanRenderTargetCache::TileMergeAction::kSkipDraw:
-        CountFrameEvent(g_frame_events.tile_draws_merged);
-        if (g_frame_dump.active) {
-          ++g_frame_dump.frame_tile_draws_merged;
-        }
-        return true;
-      case VulkanRenderTargetCache::TileMergeAction::kDrawWithoutWindowOffset:
-        tile_merge_without_window_offset_ = true;
-        break;
-      default:
-        break;
-    }
+  if (!tile_merge_early && !apply_tile_merge()) {
+    return true;
   }
 
   // A Direct3D 9 clear drawn through a 4x view of EDRAM: applied straight to
@@ -4364,7 +4428,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // The draw itself, for the GPU time breakdown.
   SetGpuTimeCategory(primitive_processing_result.IsTessellated() ? kGpuTimeTessellation
                      : memexport_writes_possible                  ? kGpuTimeMemexport
-                                                                  : kGpuTimeDraw);
+                     : REXCVAR_GET(log_perf_gpu_passes) && gpu_timestamp_pool_ != VK_NULL_HANDLE
+                         ? GetGpuTimePassCategory(normalized_color_mask, normalized_depth_control)
+                         : kGpuTimeDraw);
 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
@@ -5371,9 +5437,16 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     const double period = double(vulkan_device->properties().timestampPeriod);
     const uint8_t* categories = gpu_timestamp_categories_.data() + size_t(slot) * kGpuTimestampsPerSlot;
     for (uint32_t i = 0; i + 1 < count; ++i) {
-      if (timestamps[i + 1] >= timestamps[i] && categories[i] < kGpuTimeCategoryCount) {
-        gpu_category_ns_[categories[i]] +=
-            uint64_t(double(timestamps[i + 1] - timestamps[i]) * period);
+      if (timestamps[i + 1] < timestamps[i]) {
+        continue;
+      }
+      const uint64_t ns = uint64_t(double(timestamps[i + 1] - timestamps[i]) * period);
+      if (categories[i] < kGpuTimeCategoryCount) {
+        gpu_category_ns_[categories[i]] += ns;
+      } else if (categories[i] >= kGpuTimePassFirst &&
+                 categories[i] < kGpuTimePassFirst + kGpuTimePassSlots) {
+        gpu_category_ns_[kGpuTimeDraw] += ns;
+        gpu_pass_ns_[categories[i] - kGpuTimePassFirst] += ns;
       }
     }
   }
@@ -5937,7 +6010,90 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
     gpu_category_ns_[i] = 0;
   }
   report += ")";
+
+  // Plain draws by render target layout (log_perf_gpu_passes), the most
+  // expensive first.
+  uint32_t order[kGpuTimePassSlots];
+  uint32_t order_count = 0;
+  for (uint32_t i = 0; i < gpu_pass_slots_used_; ++i) {
+    if (gpu_pass_ns_[i] || gpu_pass_draws_[i]) {
+      order[order_count++] = i;
+    }
+  }
+  if (order_count) {
+    std::sort(order, order + order_count,
+              [this](uint32_t a, uint32_t b) { return gpu_pass_ns_[a] > gpu_pass_ns_[b]; });
+    report += "\n         GPU draws by render targets (ms, draws per frame):";
+    for (uint32_t n = 0; n < order_count && n < 12; ++n) {
+      const uint32_t i = order[n];
+      const uint64_t key = gpu_pass_keys_[i];
+      std::string name;
+      if (i == kGpuTimePassSlots - 1) {
+        name = "all others";
+      } else {
+        name = fmt::format("pitch {} {}x", uint32_t(key & 0x3FFF), 1u << ((key >> 14) & 3));
+        if ((key >> 19) & 1) {
+          name += fmt::format(" c{}", uint32_t((key >> 32) & 0xF));
+        }
+        if ((key >> 50) & 1) {
+          name += fmt::format(" d{}", uint32_t((key >> 48) & 1));
+        }
+      }
+      report += fmt::format("{} [{}] {:.2f} {}", n ? " |" : "", name, ms_per_frame(gpu_pass_ns_[i]),
+                            uint64_t(double(gpu_pass_draws_[i]) / double(frames) + 0.5));
+    }
+  }
+  // Fresh slots for each report, so layouts of earlier scenes (menus,
+  // loading) don't fill the table. Timestamps of submissions still in flight
+  // may land in the new slots - a few draws at the boundary.
+  for (uint32_t i = 0; i < kGpuTimePassSlots; ++i) {
+    gpu_pass_ns_[i] = 0;
+    gpu_pass_draws_[i] = 0;
+    gpu_pass_keys_[i] = 0;
+  }
+  gpu_pass_slots_used_ = 0;
+  gpu_pass_last_slot_ = UINT32_MAX;
   return report;
+}
+
+uint32_t VulkanCommandProcessor::GetGpuTimePassCategory(
+    uint32_t normalized_color_mask, reg::RB_DEPTHCONTROL normalized_depth_control) {
+  const RegisterFile& regs = *register_file_;
+  const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  uint64_t key = uint64_t(surface_info.surface_pitch & 0x3FFF) |
+                 (uint64_t(surface_info.msaa_samples) << 14);
+  if (normalized_color_mask & 0xF) {
+    const auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    // (EDRAM bases left out: passes of one kind, such as shadow cascades, use
+    // several, and the layout is what tells the passes apart.)
+    key |= (uint64_t(1) << 19) | (uint64_t(uint32_t(color_info.color_format) & 0xF) << 32);
+  }
+  if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
+    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+    key |= (uint64_t(uint32_t(depth_info.depth_format) & 1) << 48) | (uint64_t(1) << 50);
+  }
+  uint32_t slot = gpu_pass_last_slot_;
+  if (slot >= gpu_pass_slots_used_ || gpu_pass_keys_[slot] != key) {
+    slot = UINT32_MAX;
+    for (uint32_t i = 0; i < gpu_pass_slots_used_; ++i) {
+      if (gpu_pass_keys_[i] == key) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot == UINT32_MAX) {
+      if (gpu_pass_slots_used_ < kGpuTimePassSlots - 1) {
+        slot = gpu_pass_slots_used_++;
+        gpu_pass_keys_[slot] = key;
+      } else {
+        slot = kGpuTimePassSlots - 1;
+        gpu_pass_slots_used_ = kGpuTimePassSlots;
+      }
+    }
+    gpu_pass_last_slot_ = slot;
+  }
+  ++gpu_pass_draws_[slot];
+  return kGpuTimePassFirst + slot;
 }
 
 void VulkanCommandProcessor::WakeSubmitWorker() {

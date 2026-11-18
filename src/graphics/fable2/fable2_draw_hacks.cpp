@@ -44,19 +44,27 @@ REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
 namespace rex::graphics::fable2 {
 
 bool ComputeMemexportOnCpu(const RegisterFile& regs, memory::Memory& memory,
-                           const Shader& vertex_shader) {
+                           const Shader& vertex_shader, uint32_t* written_start_out,
+                           uint32_t* written_length_out) {
   uint32_t written_start = 0, written_length = 0;
   const uint64_t vs_hash = vertex_shader.ucode_data_hash();
+  bool computed = false;
   if (vs_hash == kFable2TerrainTessShader) {
-    return REXCVAR_GET(terrain_tess_cpu) &&
-           ComputeFable2TerrainTess(regs, memory, vertex_shader, written_start, written_length);
+    computed = REXCVAR_GET(terrain_tess_cpu) &&
+               ComputeFable2TerrainTess(regs, memory, vertex_shader, written_start,
+                                        written_length);
+  } else if (vs_hash == kFable2SkinningShader) {
+    computed = REXCVAR_GET(skinning_cpu) &&
+               ComputeFable2Skinning(regs, memory, vertex_shader, nullptr, written_start,
+                                     written_length);
   }
-  if (vs_hash == kFable2SkinningShader) {
-    return REXCVAR_GET(skinning_cpu) &&
-           ComputeFable2Skinning(regs, memory, vertex_shader, nullptr, written_start,
-                                 written_length);
+  if (written_start_out) {
+    *written_start_out = computed ? written_start : 0;
   }
-  return false;
+  if (written_length_out) {
+    *written_length_out = computed ? written_length : 0;
+  }
+  return computed;
 }
 
 namespace {

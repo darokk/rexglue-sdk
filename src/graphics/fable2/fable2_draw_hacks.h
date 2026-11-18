@@ -24,11 +24,15 @@ namespace rex::graphics::fable2 {
 
 // If the vertex shader is one of Fable II's memexport shaders that only read
 // data the CPU wrote (terrain tessellation factors, skinning), computes its
-// output into guest memory and returns true. The draw must still run on the
-// GPU, but its memexport result no longer has to be read back. Returns false,
+// output into guest memory and returns true; its memexport result then
+// doesn't have to be read back. The output range is stored in written_start /
+// written_length when given. The CPU writes through the physical mapping,
+// which doesn't fire the write watches: a caller that doesn't run the draw on
+// the GPU must invalidate the GPU's copy of that range itself. Returns false,
 // having written nothing, otherwise.
 bool ComputeMemexportOnCpu(const RegisterFile& regs, memory::Memory& memory,
-                           const Shader& vertex_shader);
+                           const Shader& vertex_shader, uint32_t* written_start = nullptr,
+                           uint32_t* written_length = nullptr);
 
 // Whether the draw is a Direct3D 9 style depth clear (a rectangle replacing
 // all depth and stencil across the render target's width), so the old depth

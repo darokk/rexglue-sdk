@@ -9,6 +9,7 @@
  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -29,6 +30,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -352,7 +356,74 @@ ProtectStats GetProtectStats() {
           g_watch_faults.load(std::memory_order_relaxed)};
 }
 
-void NoteWatchFault() { g_watch_faults.fetch_add(1, std::memory_order_relaxed); }
+namespace {
+// Fault counts by thread and by guest page, filled from the signal handler, so
+// lock-free fixed tables only. A full table drops the extra entries.
+struct WatchFaultThread {
+  std::atomic<int> tid{0};
+  std::atomic<uint64_t> count{0};
+};
+struct WatchFaultPage {
+  std::atomic<uint32_t> page{0};  // guest address >> 12, plus 1 (0 = free)
+  std::atomic<uint64_t> count{0};
+};
+WatchFaultThread g_watch_fault_threads[32];
+WatchFaultPage g_watch_fault_pages[512];
+}  // namespace
+
+void NoteWatchFault(uint32_t guest_address) {
+  g_watch_faults.fetch_add(1, std::memory_order_relaxed);
+#if defined(__linux__)
+  const int tid = int(::syscall(SYS_gettid));
+  for (WatchFaultThread& slot : g_watch_fault_threads) {
+    int current = slot.tid.load(std::memory_order_relaxed);
+    if (current == 0 &&
+        slot.tid.compare_exchange_strong(current, tid, std::memory_order_relaxed)) {
+      current = tid;
+    }
+    if (current == tid) {
+      slot.count.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+  }
+#endif
+  const uint32_t page = (guest_address >> 12) + 1;
+  uint32_t index = (page * 2654435761u) >> 23;  // 9 bits
+  for (uint32_t probe = 0; probe < 16; ++probe, index = (index + 1) & 511) {
+    WatchFaultPage& slot = g_watch_fault_pages[index];
+    uint32_t current = slot.page.load(std::memory_order_relaxed);
+    if (current == 0 &&
+        slot.page.compare_exchange_strong(current, page, std::memory_order_relaxed)) {
+      current = page;
+    }
+    if (current == page) {
+      slot.count.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+  }
+}
+
+WatchFaultDetail TakeWatchFaultDetail() {
+  WatchFaultDetail detail;
+  for (WatchFaultThread& slot : g_watch_fault_threads) {
+    const int tid = slot.tid.load(std::memory_order_relaxed);
+    const uint64_t count = slot.count.exchange(0, std::memory_order_relaxed);
+    if (tid && count) {
+      detail.threads.emplace_back(tid, count);
+    }
+  }
+  for (WatchFaultPage& slot : g_watch_fault_pages) {
+    const uint64_t count = slot.count.exchange(0, std::memory_order_relaxed);
+    const uint32_t page = slot.page.exchange(0, std::memory_order_relaxed);
+    if (page && count) {
+      detail.pages.emplace_back((page - 1) << 12, count);
+    }
+  }
+  auto by_count = [](const auto& a, const auto& b) { return a.second > b.second; };
+  std::sort(detail.threads.begin(), detail.threads.end(), by_count);
+  std::sort(detail.pages.begin(), detail.pages.end(), by_count);
+  return detail;
+}
 
 bool WriteRuntimeProfile() {
 #if defined(__linux__)

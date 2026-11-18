@@ -559,11 +559,17 @@ class RenderTargetCache {
   // the view (which costs a copy into the view and one back out).
   // left...bottom: the cleared rectangle in the view's pixels. Returns false
   // if there is no such render target (then the clear must be drawn as usual).
-  // Changes nothing.
+  // Changes nothing. If the current owner can't take the clear (it's a 4x or
+  // a 64bpp render target, or laid out differently), and fallback_format is
+  // not negative, an existing 1x or 2x render target at the view's own base
+  // and pitch is used instead: depth of format fallback_format if
+  // fallback_is_depth, color of that format otherwise.
   bool FindClearThrough4xViewTarget(uint32_t view_base_tiles, uint32_t view_pitch_tiles,
                                     uint32_t left, uint32_t top, uint32_t right, uint32_t bottom,
                                     RenderTargetKey& target_key_out,
-                                    Transfer::Rectangle& rectangle_out) const;
+                                    Transfer::Rectangle& rectangle_out,
+                                    bool fallback_is_depth = false,
+                                    int32_t fallback_format = -1) const;
   // Makes the render target the owner of the rectangle's tiles ahead of
   // clearing it (the rectangle itself is not transferred in). Returns the
   // render target, or nullptr if it doesn't exist.
