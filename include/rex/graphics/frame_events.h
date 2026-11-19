@@ -51,6 +51,15 @@ struct FrameEvents {
   // Texture fetches of draws that got the null texture (no texture could be
   // made for the fetch constant).
   std::atomic<uint64_t> missing_textures{0};
+  // Guest occlusion queries (Vulkan): begun; measured on the host; of those,
+  // no samples passed; reported as visible without a measurement; reported
+  // visible because a render pass ended mid-query; begun twice without an end.
+  std::atomic<uint64_t> occlusion_begun{0};
+  std::atomic<uint64_t> occlusion_measured{0};
+  std::atomic<uint64_t> occlusion_zero{0};
+  std::atomic<uint64_t> occlusion_reported_visible{0};
+  std::atomic<uint64_t> occlusion_split{0};
+  std::atomic<uint64_t> occlusion_unpaired{0};
   std::atomic<uint64_t> shader_translations{0};
   std::atomic<uint64_t> pipelines_created{0};
 };

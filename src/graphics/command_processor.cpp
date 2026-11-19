@@ -416,6 +416,7 @@ void CommandProcessor::WorkerThreadMain() {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+          OnWaitTick();
         }
 
         rex::thread::MaybeYield();
@@ -1309,6 +1310,7 @@ struct HostPerfState {
   uint64_t upload_bytes_skipped_reported = 0;
   // EDRAM emulation counters of the "EDRAM per frame" line.
   uint64_t gpu_emulation_reported[16] = {};
+  uint64_t occlusion_reported[6] = {};
 };
 
 // Starts the per-thread profiling timers once the threads exist.
@@ -1714,6 +1716,27 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
       gpu_emulation_per_frame[10], gpu_emulation_per_frame[11], gpu_emulation_per_frame[7],
       gpu_emulation_per_frame[12], gpu_emulation_per_frame[13], gpu_emulation_per_frame[14],
       gpu_emulation_per_frame[15]);
+  {
+    const uint64_t occlusion[6] = {
+        g_frame_events.occlusion_begun.load(std::memory_order_relaxed),
+        g_frame_events.occlusion_measured.load(std::memory_order_relaxed),
+        g_frame_events.occlusion_zero.load(std::memory_order_relaxed),
+        g_frame_events.occlusion_reported_visible.load(std::memory_order_relaxed),
+        g_frame_events.occlusion_split.load(std::memory_order_relaxed),
+        g_frame_events.occlusion_unpaired.load(std::memory_order_relaxed)};
+    uint64_t occlusion_per_frame[6];
+    for (int i = 0; i < 6; ++i) {
+      occlusion_per_frame[i] = per_frame(occlusion[i], s.occlusion_reported[i]);
+      s.occlusion_reported[i] = occlusion[i];
+    }
+    if (occlusion_per_frame[0]) {
+      out += fmt::format(
+          "\n         occlusion queries per frame: {} begun, {} measured ({} with no samples), {} "
+          "reported visible unmeasured ({} split by a render pass), {} unpaired",
+          occlusion_per_frame[0], occlusion_per_frame[1], occlusion_per_frame[2],
+          occlusion_per_frame[3], occlusion_per_frame[4], occlusion_per_frame[5]);
+    }
+  }
 
   if (++s.prof_reports % 6 == 0) {  // every 30 s
     out += ProfReport(s);

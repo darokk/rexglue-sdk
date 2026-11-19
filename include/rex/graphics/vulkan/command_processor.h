@@ -469,10 +469,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DestroyScratchBuffer();
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
+  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out, bool may_reset);
   void DisableHostOcclusionQueries();
+  // Guest occlusion queries are measured inside render passes: these keep a
+  // query that is active across a render pass change consistent.
+  void OcclusionQueryRenderPassBegun();
+  void OcclusionQueryRenderPassEnding();
+  // Writes the results of the queries whose submissions have completed.
+  void DeliverCompletedOcclusionQueries();
+  void OnWaitTick() override;
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
   void InvalidateAllVertexBufferResidency();
@@ -896,7 +901,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t scratch_buffer_last_usage_submission_ = 0;
   bool scratch_buffer_used_ = false;
 
-  static constexpr uint32_t kMaxOcclusionQueries = 8192;
+  // Queries are taken from blocks of the pool, one block per submission that
+  // uses queries, reset (outside a render pass) when the block is taken.
+  static constexpr uint32_t kOcclusionQueryBlockSize = 2048;
+  static constexpr uint32_t kOcclusionQueryBlocks = 8;
+  static constexpr uint32_t kMaxOcclusionQueries = kOcclusionQueryBlockSize * kOcclusionQueryBlocks;
   VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
   VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
@@ -905,11 +914,32 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint8_t* occlusion_query_readback_mapping_ = nullptr;
   uint32_t occlusion_query_cursor_ = 0;
   bool occlusion_query_resources_available_ = false;
+  enum class OcclusionQueryState : uint8_t {
+    // Begun by the guest outside a render pass: the host query begins with the
+    // next render pass.
+    kWaitingForRenderPass,
+    kInRenderPass,
+    // Can't be measured (a render pass ended after drawing, no free query):
+    // reported as visible.
+    kUnmeasurable,
+  };
   struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
+    uint64_t draws_at_begin = 0;
+    OcclusionQueryState state = OcclusionQueryState::kUnmeasurable;
     bool valid = false;
   } active_occlusion_query_;
+  struct PendingOcclusionQuery {
+    uint32_t end_address;
+    uint32_t host_index;
+    uint64_t submission;
+  };
+  std::deque<PendingOcclusionQuery> occlusion_queries_pending_;
+  uint32_t occlusion_query_block_ = UINT32_MAX;
+  uint64_t occlusion_query_block_submission_ = 0;
+  uint32_t occlusion_query_block_used_ = 0;
+  uint32_t occlusion_query_block_next_ = 0;
+  uint64_t occlusion_query_block_last_submission_[kOcclusionQueryBlocks] = {};
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
