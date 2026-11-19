@@ -195,38 +195,6 @@ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   return false;
 }
 
-// Check if [base, base+length) is fully covered by existing mappings (no gaps)
-static bool IsRangeFullyMapped(void* base_address, size_t length) {
-  if (!base_address || length == 0)
-    return false;
-
-  const uintptr_t begin = reinterpret_cast<uintptr_t>(base_address);
-  const uintptr_t end = begin + length;
-  if (end < begin) {  // overflow check
-    return false;
-  }
-
-  std::ifstream maps("/proc/self/maps");
-  if (!maps.is_open())
-    return false;
-
-  uintptr_t cursor = begin;
-  std::string line;
-  while (std::getline(maps, line)) {
-    LinuxMapEntry e;
-    if (!ParseProcMapsLine(line, e))
-      continue;
-    if (e.end <= cursor)
-      continue;
-    if (e.start > cursor)
-      return false;  // gap found
-    cursor = e.end;
-    if (cursor >= end)
-      return true;
-  }
-  return cursor >= end;
-}
-
 // Convert /proc/self/maps permission chars to PageAccess
 static PageAccess PermsToPageAccess(const char perms[5]) {
   const bool r = perms[0] == 'r';
@@ -310,11 +278,16 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
   if (errno == EEXIST && base_address &&
       (allocation_type == AllocationType::kCommit ||
        allocation_type == AllocationType::kReserveCommit)) {
-    // Verify the entire range is mapped before using mprotect
-    if (IsRangeFullyMapped(base_address, length)) {
-      if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
-        return base_address;
-      }
+    // mprotect itself fails with ENOMEM when part of the range is not
+    // mapped, so no separate check is needed. The old check read and parsed
+    // all of /proc/self/maps on every commit; with the thousands of mappings
+    // that write watches split guest memory into, that took tens of ms per
+    // burst of MmAllocatePhysicalMemoryEx calls (camera-turn stutter on the
+    // Steam Deck). On ENOMEM, mappings before the gap may already have the
+    // new protection; that case already returned nullptr before, and guest
+    // heaps commit only inside their own reservations.
+    if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+      return base_address;
     }
   }
 #endif
