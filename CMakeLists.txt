@@ -321,6 +321,11 @@ if(REXGLUE_LTO)
     endif()
     target_compile_options(rexgpu-xenos PRIVATE -flto=thin)
     target_link_options(rexgpu-xenos PRIVATE -flto=thin -fuse-ld=lld)
+    # Extra flags for the LTO link, where the code is generated (e.g. -Wl,-mllvm,...).
+    if(REXGLUE_LTO_LINK_FLAGS)
+        separate_arguments(_rexglue_lto_link_flags UNIX_COMMAND "${REXGLUE_LTO_LINK_FLAGS}")
+        target_link_options(rexgpu-xenos PRIVATE ${_rexglue_lto_link_flags})
+    endif()
     message(STATUS "ReXGlue LTO: ThinLTO for rexgpu-xenos")
 endif()
 
