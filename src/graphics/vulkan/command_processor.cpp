@@ -6282,9 +6282,15 @@ void VulkanCommandProcessor::PublishSubmitJob(bool force) {
   // a fraction of the time the command processor takes to record one, so
   // only wake a waiting worker once a batch of draws has accumulated.
   constexpr uint32_t kPublishesPerWake = 64;
-  if ((force || ++submit_publishes_since_wake_ >= kPublishesPerWake) &&
-      submit_worker_waiting_.load(std::memory_order_seq_cst)) {
-    WakeSubmitWorker();
+  // Publish() is a release store. Only when the waiting flag is read does the
+  // store need to be ordered before that load (the worker sets the flag, then
+  // re-checks the published end), so the full fence is paid once per batch,
+  // not once per draw.
+  if (force || ++submit_publishes_since_wake_ >= kPublishesPerWake) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (submit_worker_waiting_.load(std::memory_order_seq_cst)) {
+      WakeSubmitWorker();
+    }
   }
 }
 

@@ -38,9 +38,12 @@ void DeferredCommandBuffer::Reset() {
   published_.store(0, std::memory_order_relaxed);
 }
 
-void DeferredCommandBuffer::Publish() {
+void DeferredCommandBuffer::Publish(std::memory_order order) {
+  // Release by default (a plain store on x86): ExecutePublished reads it with
+  // acquire. A caller that then reads another thread's flag (Dekker-style) adds
+  // its own seq_cst fence, see VulkanCommandProcessor::PublishSubmitJob.
   published_.store((uint64_t(write_block_) << kPublishedBlockShift) | uint64_t(write_offset_),
-                   std::memory_order_seq_cst);
+                   order);
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {

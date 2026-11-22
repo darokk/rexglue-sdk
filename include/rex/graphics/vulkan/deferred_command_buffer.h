@@ -45,7 +45,7 @@ class DeferredCommandBuffer {
     uint32_t block = 0;
     size_t offset = 0;
   };
-  void Publish();
+  void Publish(std::memory_order order = std::memory_order_release);
   // Executes the commands between cursor and the published end, advancing the
   // cursor. Returns whether anything was executed.
   bool ExecutePublished(VkCommandBuffer command_buffer, Cursor& cursor) const;
