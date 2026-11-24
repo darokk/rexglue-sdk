@@ -117,6 +117,8 @@ REXCVAR_DEFINE_BOOL(memexport_skip_cpu_computed, true, "GPU/Vulkan",
                     "upload it from guest memory instead")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, vulkan_async_skip_draws);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
@@ -2573,8 +2575,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  // (Not with vulkan_async_skip_draws, which presents the frames with the
+  // draws missing instead of holding the old picture.)
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                            !REXCVAR_GET(vulkan_async_skip_draws) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
     static bool skipped_incomplete_frame_logged = false;
@@ -4306,10 +4311,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // pipeline can stall, as without async compilation.
     const auto pipeline_wait_start = std::chrono::steady_clock::now();
     const bool pipeline_ready =
-        REXCVAR_GET(async_pipeline_wait) &&
+        REXCVAR_GET(async_pipeline_wait) && !REXCVAR_GET(vulkan_async_skip_draws) &&
         pipeline_cache_->WaitForPipeline(
             pipeline_handle, uint32_t(std::max(100, REXCVAR_GET(async_pipeline_wait_timeout_ms))));
-    if (REXCVAR_GET(async_pipeline_wait)) {
+    if (REXCVAR_GET(async_pipeline_wait) && !REXCVAR_GET(vulkan_async_skip_draws)) {
       NoteGpuSync(GpuSyncKind::kPipelineWait, pipeline_wait_start);
     }
     if (!pipeline_ready) {

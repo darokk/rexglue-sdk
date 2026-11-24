@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -52,6 +53,12 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DECLARE(bool, vulkan_specialize_texture_signs);
+REXCVAR_DEFINE_BOOL(vulkan_async_skip_draws, false, "GPU/Vulkan",
+                    "With async_shader_compilation: create every new pipeline on a background "
+                    "thread and skip the draws that need it until it exists, instead of "
+                    "stopping the game to create it (no freeze; an object can appear a few "
+                    "frames late the first time it's seen). Overrides async_pipeline_wait")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_specialize_texture_signs_in_background, true, "GPU/Vulkan",
                     "With vulkan_specialize_texture_signs, create a pipeline specialized for "
                     "new texture signs on a background thread and draw with the unspecialized "
@@ -453,11 +460,80 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     uint32_t magic_api;
     uint32_t version_swapped;
   } pipeline_storage_file_header;
-  if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
-            pipeline_storage_file_) &&
+  // Pipeline descriptions converted from an older storage version, to be
+  // written back in the current format.
+  bool pipeline_storage_converted = false;
+  const bool pipeline_storage_header_read =
+      fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+            pipeline_storage_file_) == 1 &&
       pipeline_storage_file_header.magic == pipeline_storage_magic &&
-      pipeline_storage_file_header.magic_api == pipeline_storage_magic_api &&
-      pipeline_storage_file_header.version_swapped == pipeline_storage_version_swapped) {
+      pipeline_storage_file_header.magic_api == pipeline_storage_magic_api;
+  // Version 0x20260228 (up to Steam Deck 1.0.4): the same description without
+  // texture_signs_fetch_mask and texture_signs - as unspecialized pipelines
+  // they're still exactly valid, so convert rather than discard them.
+  constexpr uint32_t kPipelineStorageVersionNoTextureSigns = 0x20260228;
+  constexpr size_t kTextureSignsOffset = offsetof(PipelineDescription, texture_signs_fetch_mask);
+  constexpr size_t kTextureSignsSize = sizeof(uint32_t) + sizeof(uint64_t);
+  static_assert(offsetof(PipelineDescription, texture_signs) ==
+                    kTextureSignsOffset + sizeof(uint32_t),
+                "The texture signs fields must be contiguous for the storage conversion");
+  if (pipeline_storage_header_read &&
+      rex::byte_swap(pipeline_storage_file_header.version_swapped) ==
+          kPipelineStorageVersionNoTextureSigns &&
+      pipeline_storage_version_swapped !=
+          rex::byte_swap(kPipelineStorageVersionNoTextureSigns)) {
+    constexpr size_t kOldDescriptionSize = sizeof(PipelineDescription) - kTextureSignsSize;
+    constexpr size_t kOldStoredSize = sizeof(uint64_t) + kOldDescriptionSize;
+    rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
+    int64_t old_end = rex::filesystem::Tell(pipeline_storage_file_);
+    size_t old_count =
+        size_t(old_end >= int64_t(sizeof(pipeline_storage_file_header))
+                   ? (uint64_t(old_end) - sizeof(pipeline_storage_file_header)) / kOldStoredSize
+                   : 0);
+    if (old_count && rex::filesystem::Seek(pipeline_storage_file_,
+                                           int64_t(sizeof(pipeline_storage_file_header)),
+                                           SEEK_SET)) {
+      std::vector<uint8_t> old_data(old_count * kOldStoredSize);
+      old_count = fread(old_data.data(), kOldStoredSize, old_count, pipeline_storage_file_);
+      size_t converted_count = 0, skipped_count = 0;
+      for (size_t i = 0; i < old_count; ++i) {
+        const uint8_t* old_stored = old_data.data() + i * kOldStoredSize;
+        uint64_t old_hash;
+        std::memcpy(&old_hash, old_stored, sizeof(old_hash));
+        const uint8_t* old_description = old_stored + sizeof(uint64_t);
+        if (XXH3_64bits(old_description, kOldDescriptionSize) != old_hash) {
+          // Corrupted from here on.
+          break;
+        }
+        PipelineStoredDescription converted;
+        uint8_t* description_bytes = reinterpret_cast<uint8_t*>(&converted.description);
+        std::memcpy(description_bytes, old_description, kTextureSignsOffset);
+        std::memset(description_bytes + kTextureSignsOffset, 0, kTextureSignsSize);
+        std::memcpy(description_bytes + kTextureSignsOffset + kTextureSignsSize,
+                    old_description + kTextureSignsOffset,
+                    kOldDescriptionSize - kTextureSignsOffset);
+        if (!ArePipelineRequirementsMet(converted.description)) {
+          ++skipped_count;
+          continue;
+        }
+        converted.description_hash = converted.description.GetHash();
+        pipeline_stored_descriptions.push_back(converted);
+        shader_translations_needed.emplace(converted.description.vertex_shader_hash,
+                                           converted.description.vertex_shader_modification);
+        if (converted.description.pixel_shader_hash) {
+          shader_translations_needed.emplace(converted.description.pixel_shader_hash,
+                                             converted.description.pixel_shader_modification);
+        }
+        ++converted_count;
+      }
+      pipeline_storage_converted = true;
+      REXGPU_WARN(
+          "VulkanPipelineCache: Converted {} pipeline descriptions from storage version "
+          "{:08X} ({} unsupported skipped)",
+          converted_count, kPipelineStorageVersionNoTextureSigns, skipped_count);
+    }
+  } else if (pipeline_storage_header_read &&
+             pipeline_storage_file_header.version_swapped == pipeline_storage_version_swapped) {
     rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
     int64_t pipeline_storage_told_end = rex::filesystem::Tell(pipeline_storage_file_);
     size_t pipeline_storage_told_count =
@@ -708,7 +784,20 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       pipeline_storage_file_,
       uint64_t(sizeof(pipeline_storage_file_header) +
                sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
-  if (pipeline_stored_descriptions.empty()) {
+  if (pipeline_storage_converted) {
+    // Rewrite in the current format.
+    rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
+    pipeline_storage_file_header.magic = pipeline_storage_magic;
+    pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
+    pipeline_storage_file_header.version_swapped = pipeline_storage_version_swapped;
+    fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+           pipeline_storage_file_);
+    if (!pipeline_stored_descriptions.empty()) {
+      fwrite(pipeline_stored_descriptions.data(), sizeof(PipelineStoredDescription),
+             pipeline_stored_descriptions.size(), pipeline_storage_file_);
+    }
+    fflush(pipeline_storage_file_);
+  } else if (pipeline_stored_descriptions.empty()) {
     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
     pipeline_storage_file_header.magic = pipeline_storage_magic;
     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
@@ -1192,9 +1281,24 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
+  const bool skip_draws = REXCVAR_GET(async_shader_compilation) &&
+                          REXCVAR_GET(vulkan_async_skip_draws) && !creation_threads_.empty();
+
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (found_pipeline == VK_NULL_HANDLE &&
+        it->second.is_placeholder.load(std::memory_order_acquire)) {
+      // Queued for a creation thread (vulkan_async_skip_draws) - the caller
+      // skips the draw or waits for it.
+      last_pipeline_ = nullptr;
+      pipeline_out = VK_NULL_HANDLE;
+      pipeline_layout_out = it->second.pipeline_layout.load(std::memory_order_acquire);
+      if (pipeline_handle_out) {
+        *pipeline_handle_out = &it->second;
+      }
+      return pipeline_handle_out != nullptr;
+    }
     if (found_pipeline == VK_NULL_HANDLE) {
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
@@ -1224,7 +1328,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool queued_async_creation = false;
-  if (use_async) {
+  if (skip_draws && pipeline_handle_out) {
+    // Nothing created now: the draws are skipped until a creation thread has
+    // made the pipeline.
+    creation_arguments_real.priority = use_async ? async_priority : pipeline_util::kPriorityLowest;
+    pipeline.second.is_placeholder.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments_real);
+    }
+    creation_request_cond_.notify_one();
+    queued_async_creation = true;
+  } else if (use_async) {
     creation_arguments_real.priority = async_priority;
     PipelineCreationArguments creation_arguments_placeholder;
     if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
@@ -1268,6 +1383,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
   pipeline_layout_out = pipeline.second.pipeline_layout.load(std::memory_order_acquire);
   if (pipeline_handle_out) {
     *pipeline_handle_out = &pipeline.second;
+  }
+  if (pipeline_out == VK_NULL_HANDLE && pipeline.second.is_placeholder.load(std::memory_order_acquire)) {
+    // Queued (vulkan_async_skip_draws).
+    last_pipeline_ = nullptr;
+    return pipeline_handle_out != nullptr;
   }
   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
 }
@@ -3702,6 +3822,9 @@ void VulkanPipelineCache::CreateQueuedPipeline(
     creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
   } else {
     creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE, std::memory_order_release);
+    // Not pending any more (vulkan_async_skip_draws): the next use tries again
+    // on the command processor thread.
+    creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
   }
 }
 
