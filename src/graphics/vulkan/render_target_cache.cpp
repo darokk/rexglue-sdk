@@ -58,6 +58,19 @@ REXCVAR_DEFINE_BOOL(edram_forward_4x_clears, true, "GPU/Vulkan",
                     "copies per frame)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(edram_forward_4x_stencil_clears, true, "GPU/Vulkan",
+                    "Also forward 4x-view clears of the stencil alone (depth kept) to the depth "
+                    "render target at the view's own base, clearing only its stencil (Fable II: "
+                    "the screen-space shadow pass, about 10,000 tile-samples of copies per "
+                    "frame through a temporary 4x render target otherwise)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(edram_forward_4x_clears_to_4x, true, "GPU/Vulkan",
+                    "Also forward 4x-view clears to real 4x multisampled render targets with "
+                    "the view's layout (Fable II's 4x render-to-texture jobs), instead of "
+                    "copying the surrounding render targets into them first")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(resolve_direct_hdr_depth, true, "GPU/Vulkan",
                     "With resolve_direct_to_texture, also resolve 2:10:10:10 float color "
                     "(Fable II's HDR scene, both tiles) and float24 depth straight into the "
@@ -2075,15 +2088,32 @@ bool VulkanRenderTargetCache::TryForwardClearThrough4xView(
   // What the clear writes.
   const reg::RB_DEPTHCONTROL depth_control = normalized_depth_control;
   bool writes_depth = false;
-  if (depth_control.z_enable || depth_control.stencil_enable) {
+  // Stencil replaced, depth kept (depth test off, so every sample passes).
+  const bool stencil_only =
+      REXCVAR_GET(edram_forward_4x_stencil_clears) && depth_control.stencil_enable &&
+      !depth_control.z_enable && depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+      depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+      (!depth_control.backface_enable ||
+       (depth_control.stencilfunc_bf == xenos::CompareFunction::kAlways &&
+        depth_control.stencilzpass_bf == xenos::StencilOp::kReplace)) &&
+      regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask == 0xFF;
+  if ((depth_control.z_enable || depth_control.stencil_enable) && !stencil_only) {
     // Only depth and stencil replaced together (the host clears both).
     if (!depth_control.z_enable || !depth_control.z_write_enable ||
         depth_control.zfunc != xenos::CompareFunction::kAlways || !depth_control.stencil_enable ||
         depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
         depth_control.stencilzpass != xenos::StencilOp::kReplace ||
         regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0xFF) {
+      if (g_frame_dump.active) {
+        FrameDumpEvent(fmt::format("  (partial depth/stencil clear: depth control {:08X} stencil "
+                                   "{:08X} color mask {:X} pixel shader {})",
+                                   depth_control.value, regs[XE_GPU_REG_RB_STENCILREFMASK],
+                                   normalized_color_mask, pixel_shader ? 1 : 0));
+      }
       return reject(__LINE__);
     }
+    writes_depth = true;
+  } else if (stencil_only) {
     writes_depth = true;
   }
   bool writes_color = false;
@@ -2197,6 +2227,8 @@ bool VulkanRenderTargetCache::TryForwardClearThrough4xView(
     RenderTargetKey key;
     Transfer::Rectangle rectangle;
     uint64_t clear_value;
+    // Only the stencil of a depth render target (the depth transferred in).
+    bool stencil_only = false;
   };
   Target targets[2];
   uint32_t target_count = 0;
@@ -2206,7 +2238,9 @@ bool VulkanRenderTargetCache::TryForwardClearThrough4xView(
     if (!FindClearThrough4xViewTarget(depth_info.depth_base, view_pitch_tiles, uint32_t(rect[0]),
                                       uint32_t(rect[1]), uint32_t(rect[2]), uint32_t(rect[3]),
                                       target.key, target.rectangle, true,
-                                      int32_t(depth_info.depth_format))) {
+                                      int32_t(depth_info.depth_format),
+                                      REXCVAR_GET(edram_forward_4x_clears_to_4x), stencil_only) ||
+        (stencil_only && !target.key.is_depth)) {
       if (g_frame_dump.active) {
         FrameDumpEvent(fmt::format(
             "  (no target for the depth clear: view base {}t pitch {}t, rectangle {},{}-{},{}, "
@@ -2228,6 +2262,7 @@ bool VulkanRenderTargetCache::TryForwardClearThrough4xView(
     if (target.key.is_depth && target.key.GetDepthFormat() != depth_info.depth_format) {
       return reject(__LINE__);
     }
+    target.stencil_only = stencil_only;
     ++target_count;
   }
   if (writes_color) {
@@ -2237,7 +2272,9 @@ bool VulkanRenderTargetCache::TryForwardClearThrough4xView(
         !FindClearThrough4xViewTarget(color_info.color_base, view_pitch_tiles, uint32_t(rect[0]),
                                       uint32_t(rect[1]), uint32_t(rect[2]), uint32_t(rect[3]),
                                       target.key, target.rectangle, false,
-                                      int32_t(GetColorKeyFormat(color_info.color_format))) ||
+                                      int32_t(GetColorKeyFormat(color_info.color_format)),
+                                      REXCVAR_GET(edram_forward_4x_clears_to_4x), false,
+                                      target_count ? int32_t(targets[0].key.msaa_samples) : -1) ||
         target.key.is_depth || target.key.GetColorFormat() != color_info.color_format) {
       return reject(__LINE__);
     }
@@ -2274,17 +2311,31 @@ bool VulkanRenderTargetCache::TryForwardClearThrough4xView(
   // Clear them.
   for (uint32_t i = 0; i < target_count; ++i) {
     const Target& target = targets[i];
-    RenderTarget* render_target =
-        TakeOwnershipForClear(target.key, target.rectangle, clear_transfers_[0]);
+    RenderTarget* render_target = TakeOwnershipForClear(target.key, target.rectangle,
+                                                        clear_transfers_[0], target.stencil_only);
     if (!render_target) {
       continue;
     }
+    if (g_frame_dump.active) {
+      for (const Transfer& transfer : clear_transfers_[0]) {
+        FrameDumpEvent(fmt::format(
+            "  transfer for a forwarded clear to [{}] from [{}] tiles {}-{} ({})",
+            target.key.GetDebugName(),
+            transfer.source ? transfer.source->key().GetDebugName() : std::string("nothing"),
+            transfer.start_tiles, transfer.end_tiles, transfer.end_tiles - transfer.start_tiles));
+      }
+    }
+    resolve_clear_depth_aspects_ = target.stencil_only
+                                       ? VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT)
+                                       : VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                            VK_IMAGE_ASPECT_STENCIL_BIT);
     PerformTransfersAndResolveClears(1, &render_target, clear_transfers_, &target.clear_value,
                                      &target.rectangle);
+    resolve_clear_depth_aspects_ = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     if (g_frame_dump.active) {
       FrameDumpEvent(fmt::format(
-          "  clear through a 4x view forwarded to [{}]: {}x{} at {},{}, value {:08X}",
-          target.key.GetDebugName(), target.rectangle.width_pixels,
+          "  clear through a 4x view forwarded to [{}]{}: {}x{} at {},{}, value {:08X}",
+          target.key.GetDebugName(), target.stencil_only ? " (stencil only)" : "", target.rectangle.width_pixels,
           target.rectangle.height_pixels, target.rectangle.x_pixels, target.rectangle.y_pixels,
           uint32_t(target.clear_value)));
     }
@@ -6676,8 +6727,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                   sizeof(resolve_clear_attachment.clearValue));
       uint64_t clear_value = render_target_resolve_clear_values[i];
       if (dest_rt_key.is_depth) {
-        resolve_clear_attachment.aspectMask =
-            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        resolve_clear_attachment.aspectMask = resolve_clear_depth_aspects_;
         uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
         switch (dest_rt_key.GetDepthFormat()) {
           case xenos::DepthRenderTargetFormat::kD24S8:

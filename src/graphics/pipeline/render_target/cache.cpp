@@ -937,7 +937,8 @@ void RenderTargetCache::GetResolveCopyDispatchesToDump(
 bool RenderTargetCache::FindClearThrough4xViewTarget(
     uint32_t view_base_tiles, uint32_t view_pitch_tiles, uint32_t left, uint32_t top,
     uint32_t right, uint32_t bottom, RenderTargetKey& target_key_out,
-    Transfer::Rectangle& rectangle_out, bool fallback_is_depth, int32_t fallback_format) const {
+    Transfer::Rectangle& rectangle_out, bool fallback_is_depth, int32_t fallback_format,
+    bool allow_4x_target, bool fallback_first, int32_t preferred_samples) const {
   if (GetPath() != Path::kHostRenderTargets || !view_pitch_tiles || left >= right ||
       top >= bottom) {
     return false;
@@ -956,31 +957,52 @@ bool RenderTargetCache::FindClearThrough4xViewTarget(
     return false;
   }
   --it;
-  auto usable = [&](const RenderTargetKey& key) {
-    return !key.IsEmpty() && key.msaa_samples < xenos::MsaaSamples::k4X && !key.Is64bpp() &&
+  // (A 4x target only through the search below: as the current owner it is
+  // usually a target left from an earlier 4x-view clear.)
+  auto usable = [&](const RenderTargetKey& key, bool allow_4x = false) {
+    return !key.IsEmpty() &&
+           (key.msaa_samples < xenos::MsaaSamples::k4X ||
+            (allow_4x && key.msaa_samples == xenos::MsaaSamples::k4X)) &&
+           !key.Is64bpp() &&
            key.pitch_tiles_at_32bpp == view_pitch_tiles && key.base_tiles <= view_base_tiles &&
            !((view_base_tiles - key.base_tiles) % view_pitch_tiles);
   };
   RenderTargetKey owner = it->second.render_target;
-  if (!usable(owner)) {
+  if (fallback_first || !usable(owner)) {
     // Typically the memory last held a 64bpp target or another 4x view; clear
     // into the target that has the view's layout apart from the sample count.
     if (fallback_format < 0) {
       return false;
     }
     owner = RenderTargetKey();
-    for (xenos::MsaaSamples samples : {xenos::MsaaSamples::k1X, xenos::MsaaSamples::k2X}) {
+    auto find_key = [&](bool is_depth, uint32_t resource_format, xenos::MsaaSamples samples) {
       RenderTargetKey key;
       key.base_tiles = view_base_tiles;
       key.pitch_tiles_at_32bpp = view_pitch_tiles;
       key.msaa_samples = samples;
-      key.is_depth = uint32_t(fallback_is_depth);
-      key.resource_format = uint32_t(fallback_format);
+      key.is_depth = uint32_t(is_depth);
+      key.resource_format = resource_format;
       auto found = render_targets_.find(key);
-      if (found != render_targets_.end() && found->second && usable(key)) {
-        owner = key;
+      return (found != render_targets_.end() && found->second && usable(key, true))
+                 ? key
+                 : RenderTargetKey();
+    };
+    // A real 4x target first only when asked for (the depth target of the same
+    // clear is 4x); otherwise only after everything else, so a 4x target left
+    // from an earlier 4x-view clear isn't picked over the one in use.
+    const bool prefer_4x =
+        allow_4x_target && preferred_samples == int32_t(xenos::MsaaSamples::k4X);
+    if (prefer_4x) {
+      owner = find_key(fallback_is_depth, uint32_t(fallback_format), xenos::MsaaSamples::k4X);
+    }
+    const bool prefer_2x = preferred_samples == int32_t(xenos::MsaaSamples::k2X);
+    for (xenos::MsaaSamples samples :
+         {prefer_2x ? xenos::MsaaSamples::k2X : xenos::MsaaSamples::k1X,
+          prefer_2x ? xenos::MsaaSamples::k1X : xenos::MsaaSamples::k2X}) {
+      if (!owner.IsEmpty()) {
         break;
       }
+      owner = find_key(fallback_is_depth, uint32_t(fallback_format), samples);
     }
     if (owner.IsEmpty() && fallback_is_depth) {
       // No depth target there: memory a depth clear prepares is often used as
@@ -990,35 +1012,29 @@ bool RenderTargetCache::FindClearThrough4xViewTarget(
            {xenos::ColorRenderTargetFormat::k_8_8_8_8, xenos::ColorRenderTargetFormat::k_2_10_10_10,
             xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT}) {
         for (xenos::MsaaSamples samples : {xenos::MsaaSamples::k1X, xenos::MsaaSamples::k2X}) {
-          RenderTargetKey key;
-          key.base_tiles = view_base_tiles;
-          key.pitch_tiles_at_32bpp = view_pitch_tiles;
-          key.msaa_samples = samples;
-          key.is_depth = 0;
-          key.resource_format = uint32_t(GetColorResourceFormat(color_format));
-          auto found = render_targets_.find(key);
-          if (found != render_targets_.end() && found->second && usable(key)) {
-            owner = key;
-            break;
+          if (owner.IsEmpty()) {
+            owner = find_key(false, uint32_t(GetColorResourceFormat(color_format)), samples);
           }
         }
-        if (!owner.IsEmpty()) {
-          break;
-        }
       }
+    }
+    if (owner.IsEmpty() && allow_4x_target && !prefer_4x) {
+      owner = find_key(fallback_is_depth, uint32_t(fallback_format), xenos::MsaaSamples::k4X);
     }
     if (owner.IsEmpty()) {
       return false;
     }
   }
+  const bool owner_is_4x = owner.msaa_samples == xenos::MsaaSamples::k4X;
+  const uint32_t x_scale_log2 = uint32_t(!owner_is_4x);
   const uint32_t y_scale_log2 = uint32_t(owner.msaa_samples == xenos::MsaaSamples::k1X);
   const uint32_t owner_tile_height =
       xenos::kEdramTileHeightSamples >> uint32_t(owner.msaa_samples >= xenos::MsaaSamples::k2X);
   const uint32_t row_offset = (view_base_tiles - owner.base_tiles) / view_pitch_tiles;
   Transfer::Rectangle rectangle;
-  rectangle.x_pixels = left << 1;
+  rectangle.x_pixels = left << x_scale_log2;
   rectangle.y_pixels = row_offset * owner_tile_height + (top << y_scale_log2);
-  rectangle.width_pixels = (right - left) << 1;
+  rectangle.width_pixels = (right - left) << x_scale_log2;
   rectangle.height_pixels = (bottom - top) << y_scale_log2;
   // Within the render target (which may reach around the end of EDRAM once).
   if (rectangle.y_pixels + rectangle.height_pixels >
@@ -1035,7 +1051,7 @@ bool RenderTargetCache::FindClearThrough4xViewTarget(
 
 RenderTargetCache::RenderTarget* RenderTargetCache::TakeOwnershipForClear(
     RenderTargetKey target_key, const Transfer::Rectangle& rectangle,
-    std::vector<Transfer>& transfers_out) {
+    std::vector<Transfer>& transfers_out, bool keep_contents) {
   transfers_out.clear();
   auto it = render_targets_.find(target_key);
   if (it == render_targets_.end() || !it->second) {
@@ -1051,7 +1067,8 @@ RenderTargetCache::RenderTarget* RenderTargetCache::TakeOwnershipForClear(
        xenos::kEdramTileHeightSamples) *
           pitch_tiles +
       (rectangle.x_pixels + rectangle.width_pixels - 1) / xenos::kEdramTileWidthSamples + 1;
-  ChangeOwnership(target_key, start_tiles, end_tiles - start_tiles, &transfers_out, &rectangle);
+  ChangeOwnership(target_key, start_tiles, end_tiles - start_tiles, &transfers_out,
+                  keep_contents ? nullptr : &rectangle);
   return it->second;
 }
 

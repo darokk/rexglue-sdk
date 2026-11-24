@@ -563,19 +563,31 @@ class RenderTargetCache {
   // a 64bpp render target, or laid out differently), and fallback_format is
   // not negative, an existing 1x or 2x render target at the view's own base
   // and pitch is used instead: depth of format fallback_format if
-  // fallback_is_depth, color of that format otherwise.
+  // fallback_is_depth, color of that format otherwise. With allow_4x_target,
+  // a real 4x render target with the view's own layout (the game rendering
+  // with 4x MSAA, not just clearing through the view) is also accepted, and
+  // the rectangle is then in its pixels unchanged. With fallback_first, the
+  // render target at the view's own base and pitch is preferred over the
+  // current owner. preferred_samples (a xenos::MsaaSamples, or -1): the sample
+  // count tried first in that search.
   bool FindClearThrough4xViewTarget(uint32_t view_base_tiles, uint32_t view_pitch_tiles,
                                     uint32_t left, uint32_t top, uint32_t right, uint32_t bottom,
                                     RenderTargetKey& target_key_out,
                                     Transfer::Rectangle& rectangle_out,
                                     bool fallback_is_depth = false,
-                                    int32_t fallback_format = -1) const;
+                                    int32_t fallback_format = -1,
+                                    bool allow_4x_target = false,
+                                    bool fallback_first = false,
+                                    int32_t preferred_samples = -1) const;
   // Makes the render target the owner of the rectangle's tiles ahead of
   // clearing it (the rectangle itself is not transferred in). Returns the
   // render target, or nullptr if it doesn't exist.
+  // With keep_contents (a clear of only some of the bits, such as stencil
+  // alone), the rectangle is transferred in too.
   RenderTarget* TakeOwnershipForClear(RenderTargetKey target_key,
                                       const Transfer::Rectangle& rectangle,
-                                      std::vector<Transfer>& transfers_out);
+                                      std::vector<Transfer>& transfers_out,
+                                      bool keep_contents = false);
   // The format in the key of the render target used for a guest color format.
   xenos::ColorRenderTargetFormat GetColorKeyFormat(xenos::ColorRenderTargetFormat format) const {
     return GetColorResourceFormat(format);

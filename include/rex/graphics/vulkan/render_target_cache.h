@@ -853,6 +853,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
   // bound checks.
+  // Aspects cleared in depth render targets by PerformTransfersAndResolveClears
+  // (stencil alone for forwarded stencil-only clears).
+  VkImageAspectFlags resolve_clear_depth_aspects_ =
+      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
   void PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
