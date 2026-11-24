@@ -27,6 +27,17 @@
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 
+REXCVAR_DEFINE_BOOL(spirv_experiment_implicit_lod, false, "GPU/Shader",
+                    "Measurement: in pixel shaders, sample 2D and cube textures with the "
+                    "hardware's own level of detail plus a bias instead of explicit gradients "
+                    "scaled by the bias (same LOD in theory, small differences possible)");
+
+REXCVAR_DEFINE_BOOL(vulkan_specialize_texture_signs, true, "GPU/Vulkan",
+                    "Compile each pipeline for the signedness and gamma of the textures bound "
+                    "when it is created (Vulkan specialization constants), so texture fetches "
+                    "need no run-time branches on them; other combinations get their own "
+                    "pipelines. Read when shaders are translated");
+
 REXCVAR_DEFINE_BOOL(spirv_clamp_relative_float_constants, true, "GPU/Shader",
                     "Clamp relatively addressed float constant indices (c[a0+N], c[aL+N]) to "
                     "the float constant array so an out-of-range index can't read outside the "
@@ -201,6 +212,10 @@ void SpirvShaderTranslator::StartTranslation() {
   ext_inst_glsl_std_450_ = builder_->import("GLSL.std.450");
   builder_->setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
   builder_->setSource(spv::SourceLanguageUnknown, 0);
+
+  for (spv::Id& texture_signs_spec_constant : texture_signs_spec_constants_) {
+    texture_signs_spec_constant = spv::NoResult;
+  }
 
   type_void_ = builder_->makeVoidType();
   type_bool_ = builder_->makeBoolType();

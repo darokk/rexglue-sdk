@@ -93,6 +93,11 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport_per_occurrence, true, "GPU/Vulkan"
                     "readback, which stalls the GPU thread for the whole frame so far")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(log_perf_gpu_shaders, false, "GPU/Vulkan",
+                    "With log_perf_gpu_passes, break the draws down by vertex and pixel shader "
+                    "pair instead of by render target layout (first 39 pairs of each report)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(log_perf_gpu_passes, false, "GPU/Vulkan",
                     "With log_perf_file, also split the GPU time of plain draws by the "
                     "render targets they draw to (pitch, samples, color 0 and depth "
@@ -4577,7 +4582,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SetGpuTimeCategory(primitive_processing_result.IsTessellated() ? kGpuTimeTessellation
                      : memexport_writes_possible                  ? kGpuTimeMemexport
                      : REXCVAR_GET(log_perf_gpu_passes) && gpu_timestamp_pool_ != VK_NULL_HANDLE
-                         ? GetGpuTimePassCategory(normalized_color_mask, normalized_depth_control)
+                         ? (gpu_pass_shader_vs_ = vertex_shader->ucode_data_hash(),
+                            gpu_pass_shader_ps_ = pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                            GetGpuTimePassCategory(normalized_color_mask, normalized_depth_control))
                          : kGpuTimeDraw);
 
   // After all commands that may dispatch, copy or insert barriers, submit
@@ -4588,6 +4595,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_framebuffer());
 
   if (g_frame_dump.active) {
+    g_frame_dump.next_depth_control = normalized_depth_control.value;
+    g_frame_dump.next_stencil_ref_mask = regs[XE_GPU_REG_RB_STENCILREFMASK];
+    g_frame_dump.next_color_mask = normalized_color_mask;
+    if (primitive_processing_result.IsTessellated()) {
+      g_frame_dump.next_tess =
+          uint32_t(primitive_processing_result.tessellation_mode) |
+          (uint32_t(primitive_processing_result.host_vertex_shader_type) << 4);
+      g_frame_dump.next_tess_min = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
+      g_frame_dump.next_tess_max = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+    } else {
+      g_frame_dump.next_tess = 0;
+    }
     FrameDumpDraw(regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
                   regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], bin_select_, bin_mask_,
                   vertex_shader->ucode_data_hash(),
@@ -6192,12 +6211,14 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
     std::sort(order, order + order_count,
               [this](uint32_t a, uint32_t b) { return gpu_pass_ns_[a] > gpu_pass_ns_[b]; });
     report += "\n         GPU draws by render targets (ms, draws per frame):";
-    for (uint32_t n = 0; n < order_count && n < 12; ++n) {
+    for (uint32_t n = 0; n < order_count && n < (REXCVAR_GET(log_perf_gpu_shaders) ? 20u : 12u); ++n) {
       const uint32_t i = order[n];
       const uint64_t key = gpu_pass_keys_[i];
       std::string name;
       if (i == kGpuTimePassSlots - 1) {
         name = "all others";
+      } else if (REXCVAR_GET(log_perf_gpu_shaders)) {
+        name = fmt::format("vs {:016X} ps {:016X}", gpu_pass_vs_[i], gpu_pass_ps_[i]);
       } else {
         name = fmt::format("pitch {} {}x", uint32_t(key & 0x3FFF), 1u << ((key >> 14) & 3));
         if ((key >> 19) & 1) {
@@ -6240,6 +6261,9 @@ uint32_t VulkanCommandProcessor::GetGpuTimePassCategory(
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     key |= (uint64_t(uint32_t(depth_info.depth_format) & 1) << 48) | (uint64_t(1) << 50);
   }
+  if (REXCVAR_GET(log_perf_gpu_shaders)) {
+    key = gpu_pass_shader_ps_ * 0x9E3779B97F4A7C15ull ^ gpu_pass_shader_vs_;
+  }
   uint32_t slot = gpu_pass_last_slot_;
   if (slot >= gpu_pass_slots_used_ || gpu_pass_keys_[slot] != key) {
     slot = UINT32_MAX;
@@ -6253,6 +6277,8 @@ uint32_t VulkanCommandProcessor::GetGpuTimePassCategory(
       if (gpu_pass_slots_used_ < kGpuTimePassSlots - 1) {
         slot = gpu_pass_slots_used_++;
         gpu_pass_keys_[slot] = key;
+        gpu_pass_vs_[slot] = gpu_pass_shader_vs_;
+        gpu_pass_ps_[slot] = gpu_pass_shader_ps_;
       } else {
         slot = kGpuTimePassSlots - 1;
         gpu_pass_slots_used_ = kGpuTimePassSlots;

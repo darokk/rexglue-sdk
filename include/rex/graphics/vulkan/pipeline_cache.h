@@ -177,6 +177,11 @@ class VulkanPipelineCache {
     uint64_t pixel_shader_hash;
     uint64_t pixel_shader_modification;
     VulkanRenderTargetCache::RenderPassKey render_pass_key;
+    // Fetch constants whose swizzled signs the pipeline is specialized for
+    // (vulkan_specialize_texture_signs), up to 8, and their signs, a byte each
+    // in the order of the fetch constant indices.
+    uint32_t texture_signs_fetch_mask;
+    uint64_t texture_signs;
 
     // Shader stages.
     PipelineGeometryShader geometry_shader : 2;  // 2
@@ -210,7 +215,7 @@ class VulkanPipelineCache {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20260228;
+    static constexpr uint32_t kVersion = 0x20261124;
     PipelineDescription() {
       Reset();
     }

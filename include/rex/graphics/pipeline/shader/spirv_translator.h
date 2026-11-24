@@ -26,6 +26,12 @@ namespace rex::graphics {
 
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
+  // SpecId of the specialization constant with the swizzled signs of fetch
+  // constant N: kSpecIdTextureSignsFirst + N. The default (not specialized)
+  // is kTextureSignsSpecDynamic: the signs are read from the system constants.
+  static constexpr uint32_t kSpecIdTextureSignsFirst = 64;
+  static constexpr uint32_t kTextureSignsSpecDynamic = UINT32_MAX;
+
   union Modification {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
@@ -969,6 +975,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_vfetch_address_;
   // float.
   spv::Id var_main_tfetch_lod_;
+  // Specialization constants with the swizzled signs (8 bits, at bits 0:7) of
+  // each fetch constant, kTextureSignsSpecDynamic when not specialized
+  // (vulkan_specialize_texture_signs).
+  spv::Id texture_signs_spec_constants_[32];
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;

@@ -139,6 +139,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  const VulkanTextureCache& texture_cache() const { return *texture_cache_; }
+
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
@@ -716,6 +718,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t GetGpuTimePassCategory(uint32_t normalized_color_mask,
                                   reg::RB_DEPTHCONTROL normalized_depth_control);
   uint64_t gpu_pass_keys_[kGpuTimePassSlots] = {};
+  // log_perf_gpu_shaders: the shaders of each slot (the key is then the pair's hash).
+  uint64_t gpu_pass_vs_[kGpuTimePassSlots] = {};
+  uint64_t gpu_pass_ps_[kGpuTimePassSlots] = {};
+  uint64_t gpu_pass_shader_vs_ = 0, gpu_pass_shader_ps_ = 0;
   uint32_t gpu_pass_slots_used_ = 0;
   uint32_t gpu_pass_last_slot_ = UINT32_MAX;
   uint64_t gpu_pass_draws_[kGpuTimePassSlots] = {};
@@ -801,6 +807,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
   std::unique_ptr<VulkanTextureCache> texture_cache_;
+
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

@@ -51,6 +51,8 @@
 #include <rex/types.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, vulkan_specialize_texture_signs);
+
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
@@ -1253,6 +1255,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
+  // The SPIR-V binary next to the guest ucode (dump_shaders), for reading
+  // what a guest shader turns into.
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation.Dump(REXCVAR_GET(dump_shaders), "vk");
+  }
 
   // TODO(Triang3l): Log that the shader has been successfully translated in
   // common code.
@@ -1401,6 +1408,28 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
          pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
   }
   description_out.render_pass_key = render_pass_key;
+
+  if (REXCVAR_GET(vulkan_specialize_texture_signs)) {
+    // The swizzled signs of the textures the shaders use (as bound by
+    // RequestTextures for this draw), for the specialization constants.
+    uint32_t used_textures =
+        static_cast<const SpirvShader&>(vertex_shader->shader())
+            .GetUsedTextureMaskAfterTranslation() |
+        (pixel_shader ? static_cast<const SpirvShader&>(pixel_shader->shader())
+                            .GetUsedTextureMaskAfterTranslation()
+                      : 0);
+    const VulkanTextureCache& texture_cache = command_processor_.texture_cache();
+    uint32_t texture_count = 0;
+    uint32_t fetch_constant_index;
+    while (texture_count < 8 && rex::bit_scan_forward(used_textures, &fetch_constant_index)) {
+      used_textures &= ~(UINT32_C(1) << fetch_constant_index);
+      description_out.texture_signs_fetch_mask |= UINT32_C(1) << fetch_constant_index;
+      description_out.texture_signs |=
+          uint64_t(texture_cache.GetActiveTextureSwizzledSigns(fetch_constant_index))
+          << (8 * texture_count);
+      ++texture_count;
+    }
+  }
 
   bool tessellated = primitive_processing_result.IsTessellated();
   PipelineGeometryShader geometry_shader = PipelineGeometryShader::kNone;
@@ -3464,6 +3493,33 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   pipeline_create_info.pNext = use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
   pipeline_create_info.flags = 0;
+  // The texture signs the pipeline is specialized for (every stage gets them;
+  // a stage without the constants ignores them).
+  VkSpecializationMapEntry texture_signs_map_entries[8];
+  uint32_t texture_signs_spec_data[8];
+  VkSpecializationInfo texture_signs_spec_info;
+  if (description.texture_signs_fetch_mask) {
+    uint32_t entry_count = 0;
+    uint32_t fetch_mask = description.texture_signs_fetch_mask;
+    uint32_t fetch_constant_index;
+    while (entry_count < 8 && rex::bit_scan_forward(fetch_mask, &fetch_constant_index)) {
+      fetch_mask &= ~(UINT32_C(1) << fetch_constant_index);
+      VkSpecializationMapEntry& entry = texture_signs_map_entries[entry_count];
+      entry.constantID = SpirvShaderTranslator::kSpecIdTextureSignsFirst + fetch_constant_index;
+      entry.offset = uint32_t(sizeof(uint32_t) * entry_count);
+      entry.size = sizeof(uint32_t);
+      texture_signs_spec_data[entry_count] =
+          uint32_t(description.texture_signs >> (8 * entry_count)) & 0xFF;
+      ++entry_count;
+    }
+    texture_signs_spec_info.mapEntryCount = entry_count;
+    texture_signs_spec_info.pMapEntries = texture_signs_map_entries;
+    texture_signs_spec_info.dataSize = sizeof(uint32_t) * entry_count;
+    texture_signs_spec_info.pData = texture_signs_spec_data;
+    for (uint32_t i = 0; i < shader_stage_count; ++i) {
+      shader_stages[i].pSpecializationInfo = &texture_signs_spec_info;
+    }
+  }
   pipeline_create_info.stageCount = shader_stage_count;
   pipeline_create_info.pStages = shader_stages.data();
   pipeline_create_info.pVertexInputState = &vertex_input_state;

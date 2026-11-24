@@ -1296,6 +1296,13 @@ struct HostPerfState {
   std::string gpu_dir;   // /sys/class/drm/cardN/device
   uint64_t gpu_busy_sum = 0;
   uint32_t gpu_busy_samples = 0;
+  // Shader, memory and fabric clocks (MHz, the active level of pp_dpm_*),
+  // sampled every 4th frame: the Deck shares 15 W between CPU, GPU and memory,
+  // and runs differ by which way the power goes.
+  int clock_fds[3] = {-2, -2, -2};
+  uint64_t clock_sums[3] = {};
+  uint32_t clock_samples = 0;
+  uint32_t clock_frame = 0;
   // amdgpu hwmon power1_average (microwatts; the whole APU on the Steam Deck).
   int power_fd = -1;
   uint64_t power_sum = 0;
@@ -1526,6 +1533,47 @@ void CommandProcessor::HostPerfSampleFrame() {
     }
   }
   if (s.gpu_busy_fd < 0) return;
+  if (!(s.clock_frame++ & 3)) {
+    static const char* const kClockFiles[3] = {"pp_dpm_sclk", "pp_dpm_mclk", "pp_dpm_fclk"};
+    uint32_t clocks[3] = {};
+    bool all = true;
+    for (int i = 0; i < 3; ++i) {
+      if (s.clock_fds[i] == -2) {
+        s.clock_fds[i] =
+            ::open((s.gpu_dir + "/" + kClockFiles[i]).c_str(), O_RDONLY | O_CLOEXEC);
+      }
+      char clock_buf[256];
+      const ssize_t clock_n =
+          s.clock_fds[i] >= 0 ? ::pread(s.clock_fds[i], clock_buf, sizeof(clock_buf) - 1, 0) : 0;
+      if (clock_n <= 0) {
+        all = false;
+        continue;
+      }
+      clock_buf[clock_n] = 0;
+      // The line marked with '*': "N: 1234Mhz *".
+      const char* star = std::strchr(clock_buf, '*');
+      if (!star) {
+        all = false;
+        continue;
+      }
+      const char* line = star;
+      while (line > clock_buf && line[-1] != 0x0A) {
+        --line;
+      }
+      const char* colon = std::strchr(line, ':');
+      if (!colon || colon > star) {
+        all = false;
+        continue;
+      }
+      clocks[i] = uint32_t(std::strtoul(colon + 1, nullptr, 10));
+    }
+    if (all) {
+      for (int i = 0; i < 3; ++i) {
+        s.clock_sums[i] += clocks[i];
+      }
+      ++s.clock_samples;
+    }
+  }
   char buf[16];
   const ssize_t n = ::pread(s.gpu_busy_fd, buf, sizeof(buf) - 1, 0);
   if (n > 0) {
@@ -1618,6 +1666,23 @@ std::string CommandProcessor::HostPerfReport(double seconds) {
   }
   s.gpu_busy_sum = 0;
   s.gpu_busy_samples = 0;
+  if (s.clock_samples) {
+    out += fmt::format("; clocks avg GPU {} memory {} fabric {} MHz",
+                       s.clock_sums[0] / s.clock_samples, s.clock_sums[1] / s.clock_samples,
+                       s.clock_sums[2] / s.clock_samples);
+  }
+  s.clock_sums[0] = s.clock_sums[1] = s.clock_sums[2] = 0;
+  s.clock_samples = 0;
+  if (!s.gpu_dir.empty()) {
+    // Where the GPU memory is (the Deck's 1 GB carve-out or system memory).
+    const std::string vram = ReadSmallFile(s.gpu_dir + "/mem_info_vram_used");
+    const std::string gtt = ReadSmallFile(s.gpu_dir + "/mem_info_gtt_used");
+    if (!vram.empty() && !gtt.empty()) {
+      out += fmt::format("; VRAM {} MB GTT {} MB",
+                         std::strtoull(vram.c_str(), nullptr, 10) >> 20,
+                         std::strtoull(gtt.c_str(), nullptr, 10) >> 20);
+    }
+  }
   if (s.power_samples) {
     out += fmt::format("; APU {:.1f} W", double(s.power_sum) / double(s.power_samples) / 1e6);
   }

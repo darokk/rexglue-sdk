@@ -18,9 +18,13 @@
 #include <SPIRV/GLSL.std.450.h>
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
+
+REXCVAR_DECLARE(bool, spirv_experiment_implicit_lod);
+REXCVAR_DECLARE(bool, vulkan_specialize_texture_signs);
 
 namespace rex::graphics {
 
@@ -1299,6 +1303,26 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
                                       id_vector_temp_),
           spv::NoPrecision);
+      if (REXCVAR_GET(vulkan_specialize_texture_signs)) {
+        // The signs from a specialization constant if the pipeline provides
+        // them (then the branches on them below fold away when the pipeline
+        // is compiled), from the system constants otherwise.
+        spv::Id& spec_constant = texture_signs_spec_constants_[fetch_constant_index];
+        if (spec_constant == spv::NoResult) {
+          spec_constant = builder_->makeUintConstant(kTextureSignsSpecDynamic, true);
+          builder_->addDecoration(spec_constant, spv::DecorationSpecId,
+                                  int(kSpecIdTextureSignsFirst + fetch_constant_index));
+          builder_->addName(spec_constant,
+                            fmt::format("xe_texture_signs_{}", fetch_constant_index).c_str());
+        }
+        swizzled_signs_word = builder_->createTriOp(
+            spv::OpSelect, type_uint_,
+            builder_->createBinOp(spv::OpIEqual, type_bool_, spec_constant,
+                                  builder_->makeUintConstant(kTextureSignsSpecDynamic)),
+            swizzled_signs_word,
+            builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, spec_constant,
+                                  builder_->makeUintConstant(8 * (fetch_constant_index & 3))));
+      }
       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
 
       spv::Builder::TextureParameters texture_parameters = {};
@@ -1452,7 +1476,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        if (use_computed_lod) {
+        const bool implicit_lod = REXCVAR_GET(spirv_experiment_implicit_lod) &&
+                                  is_pixel_shader() && use_computed_lod &&
+                                  !instr.attributes.use_register_gradients &&
+                                  instr.dimension != xenos::FetchOpDimension::k3DOrStacked;
+        if (use_computed_lod && !implicit_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1613,10 +1641,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
-            use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
+            implicit_lod       ? spv::ImageOperandsBiasMask
+            : use_computed_lod ? spv::ImageOperandsGradMask
+                               : spv::ImageOperandsLodMask;
         spv::Id sample_result_unsigned, sample_result_signed;
         if (!use_computed_lod) {
           texture_parameters.lod = lod;
+        } else if (implicit_lod) {
+          texture_parameters.bias = lod;
         }
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
           // 3D (3 coordinate components, 3 gradient components, single fetch)
@@ -1835,7 +1867,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (use_computed_lod && !implicit_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
