@@ -24,6 +24,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -439,6 +440,10 @@ class VulkanPipelineCache {
   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
+  // Specialized pipelines queued for a creation thread by ConfigurePipeline
+  // (vulkan_specialize_texture_signs_in_background); the unspecialized one is
+  // drawn with until they exist. Command processor thread only.
+  std::unordered_set<const Pipeline*> background_specialized_pipelines_;
 
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;

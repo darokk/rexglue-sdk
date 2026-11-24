@@ -52,6 +52,12 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DECLARE(bool, vulkan_specialize_texture_signs);
+REXCVAR_DEFINE_BOOL(vulkan_specialize_texture_signs_in_background, true, "GPU/Vulkan",
+                    "With vulkan_specialize_texture_signs, create a pipeline specialized for "
+                    "new texture signs on a background thread and draw with the unspecialized "
+                    "pipeline (created now if needed, shared by all texture signs) until it is "
+                    "ready, so specialization adds no stutter")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
@@ -842,6 +848,7 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+  background_specialized_pipelines_.clear();
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -1132,6 +1139,57 @@ bool VulkanPipelineCache::ConfigurePipeline(
                                             : normalized_depth_control.z_write_enable != 0;
     async_priority = pipeline_util::CalculatePipelinePriority(
         bound_rts, shader_writes_color_targets, shader_writes_depth);
+  }
+
+  // A pipeline specialized for the bound textures' signs that doesn't exist
+  // yet: queued for a creation thread, and the unspecialized pipeline (the
+  // signs read from the system constants, correct for any signs) is used until
+  // it's ready.
+  if (description.texture_signs_fetch_mask && !creation_threads_.empty() &&
+      REXCVAR_GET(vulkan_specialize_texture_signs_in_background)) {
+    auto specialized_it = pipelines_.find(description);
+    const bool specialized_ready =
+        specialized_it != pipelines_.end() &&
+        specialized_it->second.pipeline.load(std::memory_order_acquire) != VK_NULL_HANDLE &&
+        !specialized_it->second.is_placeholder.load(std::memory_order_acquire);
+    if (!specialized_ready) {
+      bool specialized_pending = specialized_it != pipelines_.end() &&
+                                 background_specialized_pipelines_.count(&specialized_it->second);
+      if (specialized_it == pipelines_.end()) {
+        auto& specialized = *pipelines_.emplace(description, Pipeline()).first;
+        PipelineCreationArguments specialized_creation_arguments;
+        if (TryGetPipelineCreationArgumentsForDescription(description, &specialized,
+                                                          specialized_creation_arguments)) {
+          specialized_creation_arguments.priority = pipeline_util::kPriorityLowest;
+          background_specialized_pipelines_.insert(&specialized.second);
+          {
+            std::lock_guard<std::mutex> lock(creation_request_lock_);
+            creation_queue_.push(specialized_creation_arguments);
+          }
+          creation_request_cond_.notify_one();
+          if (pipeline_storage_file_) {
+            assert_not_null(storage_write_thread_);
+            pipeline_storage_file_flush_needed_ = true;
+            {
+              std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+              storage_write_pipeline_queue_.emplace_back();
+              PipelineStoredDescription& stored_description =
+                  storage_write_pipeline_queue_.back();
+              stored_description.description_hash = description.GetHash();
+              std::memcpy(&stored_description.description, &description, sizeof(description));
+            }
+            storage_write_request_cond_.notify_all();
+          }
+          specialized_pending = true;
+        } else {
+          pipelines_.erase(description);
+        }
+      }
+      if (specialized_pending) {
+        description.texture_signs_fetch_mask = 0;
+        description.texture_signs = 0;
+      }
+    }
   }
 
   auto it = pipelines_.find(description);
