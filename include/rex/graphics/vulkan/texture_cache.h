@@ -160,6 +160,16 @@ class VulkanTextureCache final : public TextureCache {
   void CommitDirectResolve(const draw_util::ResolveInfo& resolve_info, VkImage source_image,
                            DeferredCommandBuffer::ImageCopyMode mode, int32_t source_x,
                            int32_t source_y, bool invalidate_others);
+  struct DirectResolveStorage {
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkOffset2D offset = {};
+    VkExtent2D extent = {};
+  };
+  // Try to bind the prepared destination for a compute resolve. An empty
+  // result leaves the destination ready for the normal scratch-image copy.
+  DirectResolveStorage BindDirectResolveStorage(const draw_util::ResolveInfo& resolve_info,
+                                                VkFormat format, bool invalidate_others);
+
   size_t direct_resolve_texture_count() const { return direct_resolve_targets_.size(); }
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
@@ -223,6 +233,7 @@ class VulkanTextureCache final : public TextureCache {
     enum class Usage {
       kUndefined,
       kTransferDestination,
+      kResolveStorage,
       kGuestShaderSampled,
       kSwapSampled,
     };
@@ -233,6 +244,8 @@ class VulkanTextureCache final : public TextureCache {
     ~VulkanTexture();
 
     VkImage image() const { return image_; }
+    VkFormat resolve_storage_format() const { return resolve_storage_format_; }
+    void set_resolve_storage_format(VkFormat format) { resolve_storage_format_ = format; }
 
     // Whether the image holds red and blue exchanged compared to what a load
     // from guest memory would give (a direct resolve of a red/blue-swapping
@@ -311,6 +324,7 @@ class VulkanTextureCache final : public TextureCache {
     VmaAllocation allocation_;
 
     Usage usage_ = Usage::kUndefined;
+    VkFormat resolve_storage_format_ = VK_FORMAT_UNDEFINED;
     bool rb_exchanged_ = false;
     bool direct_resolve_candidate_ = false;
 
@@ -480,8 +494,12 @@ class VulkanTextureCache final : public TextureCache {
   // Whether the host supports the copies direct resolves make into textures of
   // this guest format.
   bool IsDirectResolveFormat(xenos::TextureFormat format) const;
+  void FinishDirectResolve();
+  bool resolve_storage_hdr_supported_ = false;
+  bool resolve_storage_depth_supported_ = false;
   bool direct_resolve_blit_to_1555_supported_ = false;
   bool direct_resolve_blit_to_2101010_supported_ = false;
+  bool direct_resolve_blit_to_r8_supported_ = false;
   bool direct_resolve_blit_to_8888_supported_ = false;
   // Textures of formats direct resolves can write, by the page of their base
   // level (added when first loaded, removed when destroyed).

@@ -55,6 +55,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
     kStorageBufferPairCompute,
+    kStorageImageCompute,
     kCount,
   };
 
@@ -767,11 +768,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
+  static constexpr uint32_t kStorageImageDescriptorPoolSetCount = 256;
   static const VkDescriptorPoolSize kDescriptorPoolSizeConstants;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   static constexpr uint32_t kConstantsDescriptorPoolSetCount = 1024;
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_image_;
   // Guest draw constants are dynamic uniform buffers: a constants descriptor
   // set only depends on which upload pool pages (VkBuffers) hold the constants,
   // and the per-draw locations within them are dynamic offsets. Sets are

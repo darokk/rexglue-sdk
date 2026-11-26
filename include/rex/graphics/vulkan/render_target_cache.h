@@ -942,20 +942,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // resolve_direct_hdr_depth: a compute shader converts the render target the
   // way the path through EDRAM and memory would (2:10:10:10 float samples
   // quantized to 7e3 and averaged; depth encoded as 20e4 and decoded again)
-  // into a scratch image, which the texture cache copies into the textures.
+  // into the destination texture, with a scratch image as the fallback.
   enum DirectConvertMode : uint32_t { kDirectConvertHdr, kDirectConvertDepth };
   static constexpr uint32_t kDirectConvertImageSize = 1280;
   bool EnsureDirectConvertLayouts();
   VkPipeline GetDirectConvertPipeline(uint32_t mode, bool multisampled);
   bool EnsureDirectConvertImage(uint32_t mode);
   // Records the conversion of width x height pixels at source_x, source_y;
-  // host_sample_1 < 0 for one sample. Returns the scratch image (in the
-  // transfer source layout, its barrier pending), or VK_NULL_HANDLE.
-  VkImage RunDirectConvert(uint32_t mode, VulkanRenderTarget& source, int32_t source_x,
-                           int32_t source_y, uint32_t width, uint32_t height,
-                           int32_t host_sample_0, int32_t host_sample_1);
+  // host_sample_1 < 0 for one sample. With no destination set, returns the
+  // scratch image in transfer-source layout. With a set, writes directly at
+  // dest_offset and returns VK_NULL_HANDLE because no copy is needed.
+  VkImage RunDirectConvert(uint32_t mode, VkPipeline pipeline, VulkanRenderTarget& source,
+                           int32_t source_x, int32_t source_y, uint32_t width, uint32_t height,
+                           int32_t host_sample_0, int32_t host_sample_1,
+                           VkDescriptorSet dest_descriptor, VkOffset2D dest_offset);
   void DestroyDirectConvertResources();
-  VkDescriptorSetLayout direct_convert_storage_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool direct_convert_descriptor_pool_ = VK_NULL_HANDLE;
   VkPipelineLayout direct_convert_pipeline_layouts_[2] = {};
   VkPipeline direct_convert_pipelines_[2][2] = {};

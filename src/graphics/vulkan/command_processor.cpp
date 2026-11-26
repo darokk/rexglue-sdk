@@ -676,6 +676,9 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
 
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageImage = {
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kStorageImageDescriptorPoolSetCount};
+
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeConstants = {
     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
     SpirvShaderTranslator::kConstantBufferCount* kConstantsDescriptorPoolSetCount};
@@ -751,6 +754,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeStorageImage, 1, kStorageImageDescriptorPoolSetCount),
       transient_descriptor_allocator_constants_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -1071,6 +1078,17 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to create a Vulkan descriptor set layout for two storage "
         "buffers bound to the compute shader");
+    return false;
+  }
+
+  descriptor_set_layout_binding_transient.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptor_set_layout_create_info.bindingCount = 1;
+  descriptor_set_layout_create_info.pBindings = &descriptor_set_layout_binding_transient;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::kStorageImageCompute)]) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to create the compute storage image descriptor layout");
     return false;
   }
 
@@ -3647,18 +3665,14 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     descriptor_set = transient_descriptors_free.back();
     transient_descriptors_free.pop_back();
   } else {
-    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
-    [[maybe_unused]] const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    [[maybe_unused]] const VkDevice device = vulkan_device->device();
-    bool is_storage_buffer =
-        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferCompute ||
-        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute;
-    ui::vulkan::LinkedTypeDescriptorSetAllocator& transient_descriptor_allocator =
-        is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                          : transient_descriptor_allocator_uniform_buffer_;
+    const bool is_storage_image =
+        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageImageCompute;
+    auto& transient_descriptor_allocator = is_storage_image
+                                               ? transient_descriptor_allocator_storage_image_
+                                               : transient_descriptor_allocator_storage_buffer_;
     VkDescriptorPoolSize descriptor_count;
     descriptor_count.type =
-        is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        is_storage_image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     descriptor_count.descriptorCount =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute
             ? 2
@@ -6581,6 +6595,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
     transient_descriptors_free.clear();
   }
   single_transient_descriptors_used_.clear();
+  transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_storage_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
 }

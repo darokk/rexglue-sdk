@@ -87,6 +87,10 @@ REXCVAR_DEFINE_BOOL(resolve_direct_wrapped_depth, true, "GPU/Vulkan",
                     "contiguous and owned by one host depth target")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(resolve_convert_in_place, true, "GPU/Vulkan",
+                    "Write HDR and depth conversions into supported destination textures")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DECLARE(int32_t, resolve_direct_to_texture);
 REXCVAR_DECLARE(int32_t, resolve_direct_skip_memory);
 
@@ -1396,11 +1400,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   }
 
   // 2:10:10:10 float color and float24 depth (resolve_direct_hdr_depth):
-  // converted by a compute shader into a scratch image, then copied. The
+  // converted by a compute shader. The
   // second tile of a merged frame too: its rows are below the first tile's in
   // the render target, and its destination continues the first tile's
   // texture.
   uint32_t direct_convert_mode = UINT32_MAX;
+  VkPipeline direct_convert_pipeline = VK_NULL_HANDLE;
   uint32_t direct_convert_width = 0, direct_convert_height = 0;
   int32_t direct_convert_samples[2] = {0, -1};
   if (!direct_source && direct_mode > 0 && REXCVAR_GET(resolve_direct_hdr_depth) &&
@@ -1526,7 +1531,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                   GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) &&
               width <= kDirectConvertImageSize && height <= kDirectConvertImageSize &&
               texture_cache.PrepareDirectResolve(resolve_info, width, height, only_dependents) &&
-              GetDirectConvertPipeline(mode, rt_key.msaa_samples != xenos::MsaaSamples::k1X) !=
+              (direct_convert_pipeline = GetDirectConvertPipeline(
+                   mode, rt_key.msaa_samples != xenos::MsaaSamples::k1X)) !=
                   VK_NULL_HANDLE &&
               EnsureDirectConvertImage(mode)) {
             direct_source = &vulkan_rt;
@@ -1704,17 +1710,27 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   }
 
   if (direct_source && direct_convert_mode != UINT32_MAX) {
-    // Converted into the scratch image, then copied from there.
     command_processor_.SetGpuTimeCategory(VulkanCommandProcessor::kGpuTimeResolve);
+    VulkanTextureCache::DirectResolveStorage storage;
+    if (REXCVAR_GET(resolve_convert_in_place)) {
+      const VkFormat format = direct_convert_mode == kDirectConvertDepth
+                                  ? VK_FORMAT_R32_SFLOAT
+                                  : VK_FORMAT_R16G16B16A16_SFLOAT;
+      storage = texture_cache.BindDirectResolveStorage(resolve_info, format,
+                                                       direct_invalidate_others);
+    }
+    const bool writes_texture = storage.descriptor_set != VK_NULL_HANDLE;
     VkImage converted = RunDirectConvert(
-        direct_convert_mode, *direct_source, direct_source_x, direct_source_y,
-        direct_convert_width, direct_convert_height, direct_convert_samples[0],
-        direct_convert_samples[1]);
-    if (converted == VK_NULL_HANDLE) {
-      // Too late to take the path through memory if it was skipped: this
-      // only happens if the shader or the scratch image can't be created,
-      // the first time.
-      REXGPU_ERROR("VulkanRenderTargetCache: direct HDR/depth resolve conversion failed");
+        direct_convert_mode, direct_convert_pipeline, *direct_source, direct_source_x, direct_source_y,
+        writes_texture ? storage.extent.width : direct_convert_width,
+        writes_texture ? storage.extent.height : direct_convert_height, direct_convert_samples[0],
+        direct_convert_samples[1], storage.descriptor_set, storage.offset);
+    if (writes_texture) {
+      if (g_frame_dump.active) {
+        FrameDumpEvent(fmt::format("  -> converted directly into destination {}x{} at {},{}",
+                                   storage.extent.width, storage.extent.height,
+                                   storage.offset.x, storage.offset.y));
+      }
     } else {
       texture_cache.CommitDirectResolve(resolve_info, converted,
                                         DeferredCommandBuffer::ImageCopyMode::kCopy, 0, 0,
@@ -2411,6 +2427,7 @@ layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D xe_dest;
 #endif
 layout(push_constant) uniform XeConstants {
   ivec2 source_offset;
+  ivec2 dest_offset;
   uvec2 size;
   int sample_0;
   int sample_1;  // < 0: one sample
@@ -2497,14 +2514,15 @@ void main() {
     return;
   }
   ivec2 p = xe_c.source_offset + ivec2(id);
+  ivec2 dest = xe_c.dest_offset + ivec2(id);
 #if XE_DEPTH
-  imageStore(xe_dest, ivec2(id), vec4(XeDepthTo20e4AndBack(XeLoad(p, xe_c.sample_0).r)));
+  imageStore(xe_dest, dest, vec4(XeDepthTo20e4AndBack(XeLoad(p, xe_c.sample_0).r)));
 #else
   vec4 color = XeHdrSample(XeLoad(p, xe_c.sample_0));
   if (xe_c.sample_1 >= 0) {
     color = (color + XeHdrSample(XeLoad(p, xe_c.sample_1))) * 0.5;
   }
-  imageStore(xe_dest, ivec2(id), color);
+  imageStore(xe_dest, dest, color);
 #endif
 }
 )GLSL";
@@ -2513,6 +2531,7 @@ void main() {
 
 struct DirectConvertConstants {
   int32_t source_offset[2];
+  int32_t dest_offset[2];
   uint32_t size[2];
   int32_t sample_0;
   int32_t sample_1;
@@ -2522,30 +2541,17 @@ struct DirectConvertConstants {
 }  // namespace
 
 bool VulkanRenderTargetCache::EnsureDirectConvertLayouts() {
-  if (direct_convert_pipeline_layouts_[0] != VK_NULL_HANDLE) {
-    return true;
-  }
   if (direct_convert_layouts_failed_) {
     return false;
+  }
+  if (direct_convert_pipeline_layouts_[0] != VK_NULL_HANDLE) {
+    return true;
   }
   direct_convert_layouts_failed_ = true;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  VkDescriptorSetLayoutBinding binding = {};
-  binding.binding = 0;
-  binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  binding.descriptorCount = 1;
-  binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
-  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 1;
-  set_layout_info.pBindings = &binding;
-  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
-                                      &direct_convert_storage_layout_) != VK_SUCCESS) {
-    return false;
-  }
   VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2};
   VkDescriptorPoolCreateInfo pool_info = {};
   pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2563,7 +2569,8 @@ bool VulkanRenderTargetCache::EnsureDirectConvertLayouts() {
     VkDescriptorSetLayout set_layouts[2] = {
         mode == kDirectConvertDepth ? descriptor_set_layout_sampled_image_x2_
                                     : descriptor_set_layout_sampled_image_,
-        direct_convert_storage_layout_};
+        command_processor_.GetSingleTransientDescriptorLayout(
+            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)};
     VkPipelineLayoutCreateInfo layout_info = {};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layout_info.setLayoutCount = 2;
@@ -2655,7 +2662,9 @@ bool VulkanRenderTargetCache::EnsureDirectConvertImage(uint32_t mode) {
   allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   allocate_info.descriptorPool = direct_convert_descriptor_pool_;
   allocate_info.descriptorSetCount = 1;
-  allocate_info.pSetLayouts = &direct_convert_storage_layout_;
+  const VkDescriptorSetLayout storage_layout = command_processor_.GetSingleTransientDescriptorLayout(
+      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
+  allocate_info.pSetLayouts = &storage_layout;
   if (dfn.vkAllocateDescriptorSets(device, &allocate_info, &scratch.descriptor_set) !=
       VK_SUCCESS) {
     return false;
@@ -2675,20 +2684,15 @@ bool VulkanRenderTargetCache::EnsureDirectConvertImage(uint32_t mode) {
   return true;
 }
 
-VkImage VulkanRenderTargetCache::RunDirectConvert(uint32_t mode, VulkanRenderTarget& source,
+VkImage VulkanRenderTargetCache::RunDirectConvert(uint32_t mode, VkPipeline pipeline,
+                                                  VulkanRenderTarget& source,
                                                   int32_t source_x, int32_t source_y,
                                                   uint32_t width, uint32_t height,
-                                                  int32_t host_sample_0, int32_t host_sample_1) {
-  if (width > kDirectConvertImageSize || height > kDirectConvertImageSize ||
-      !EnsureDirectConvertImage(mode)) {
-    return VK_NULL_HANDLE;
-  }
+                                                  int32_t host_sample_0, int32_t host_sample_1,
+                                                  VkDescriptorSet dest_descriptor,
+                                                  VkOffset2D dest_offset) {
+  const bool uses_scratch = dest_descriptor == VK_NULL_HANDLE;
   const RenderTargetKey key = source.key();
-  VkPipeline pipeline =
-      GetDirectConvertPipeline(mode, key.msaa_samples != xenos::MsaaSamples::k1X);
-  if (pipeline == VK_NULL_HANDLE) {
-    return VK_NULL_HANDLE;
-  }
   DirectConvertImage& scratch = direct_convert_images_[mode];
   command_processor_.PushImageMemoryBarrier(
       source.image(),
@@ -2700,24 +2704,28 @@ VkImage VulkanRenderTargetCache::RunDirectConvert(uint32_t mode, VulkanRenderTar
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   source.SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  // The previous contents aren't needed (a copy from it may still be reading).
-  const bool scratch_was_used = scratch.layout != VK_IMAGE_LAYOUT_UNDEFINED;
-  command_processor_.PushImageMemoryBarrier(
-      scratch.image, ui::vulkan::util::InitializeSubresourceRange(),
-      scratch_was_used ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      scratch_was_used ? VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT) : VkAccessFlags(0),
-      VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+  if (uses_scratch) {
+    // The previous contents aren't needed. A copy may still be reading them.
+    const bool scratch_was_used = scratch.layout != VK_IMAGE_LAYOUT_UNDEFINED;
+    command_processor_.PushImageMemoryBarrier(
+        scratch.image, ui::vulkan::util::InitializeSubresourceRange(),
+        scratch_was_used ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        scratch_was_used ? VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT) : VkAccessFlags(0),
+        VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    dest_descriptor = scratch.descriptor_set;
+  }
   command_processor_.BindExternalComputePipeline(pipeline);
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   const VkPipelineLayout layout = direct_convert_pipeline_layouts_[mode];
-  VkDescriptorSet descriptor_sets[2] = {source.GetDescriptorSetTransferSource(),
-                                        scratch.descriptor_set};
+  VkDescriptorSet descriptor_sets[2] = {source.GetDescriptorSetTransferSource(), dest_descriptor};
   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2,
                                          descriptor_sets, 0, nullptr);
   DirectConvertConstants constants;
   constants.source_offset[0] = source_x;
   constants.source_offset[1] = source_y;
+  constants.dest_offset[0] = dest_offset.x;
+  constants.dest_offset[1] = dest_offset.y;
   constants.size[0] = width;
   constants.size[1] = height;
   constants.sample_0 = host_sample_0;
@@ -2727,6 +2735,9 @@ VkImage VulkanRenderTargetCache::RunDirectConvert(uint32_t mode, VulkanRenderTar
                                     &constants);
   command_processor_.SubmitBarriers(true);
   command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  if (!uses_scratch) {
+    return VK_NULL_HANDLE;
+  }
   command_processor_.PushImageMemoryBarrier(
       scratch.image, ui::vulkan::util::InitializeSubresourceRange(),
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -2757,8 +2768,6 @@ void VulkanRenderTargetCache::DestroyDirectConvertResources() {
   }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          direct_convert_descriptor_pool_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
-                                         direct_convert_storage_layout_);
 }
 
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
