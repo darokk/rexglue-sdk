@@ -77,6 +77,16 @@ REXCVAR_DEFINE_BOOL(resolve_direct_hdr_depth, true, "GPU/Vulkan",
                     "textures made of the destination, through a compute shader that converts "
                     "them as the path through memory does")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(resolve_direct_hdr_storage_alias, true, "GPU/Vulkan",
+                    "Use the direct HDR resolve for the blendable variant with the same "
+                    "guest storage format")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(resolve_direct_wrapped_depth, true, "GPU/Vulkan",
+                    "Convert depth directly across an EDRAM wrap when both pieces are "
+                    "contiguous and owned by one host depth target")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DECLARE(int32_t, resolve_direct_to_texture);
 REXCVAR_DECLARE(int32_t, resolve_direct_skip_memory);
 
@@ -1408,10 +1418,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           dest_format == uint32_t(xenos::TextureFormat::k_24_8_FLOAT)) {
         mode = kDirectConvertDepth;
       }
-    } else if (xenos::ColorRenderTargetFormat(edram_info.format) ==
-                   xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT &&
-               dest_format == uint32_t(xenos::ColorFormat::k_16_16_16_16_FLOAT)) {
-      mode = kDirectConvertHdr;
+    } else if (dest_format == uint32_t(xenos::ColorFormat::k_16_16_16_16_FLOAT)) {
+      const auto color_format = xenos::ColorRenderTargetFormat(edram_info.format);
+      // The blendable variant shares the 7e3 storage format. The resolve
+      // still quantizes each stored sample before averaging them.
+      const auto storage_format = REXCVAR_GET(resolve_direct_hdr_storage_alias)
+                                      ? xenos::GetStorageColorFormat(color_format)
+                                      : color_format;
+      if (storage_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
+        mode = kDirectConvertHdr;
+      }
     }
     // The samples: one, or (color only) the average of both of 2x.
     bool samples_ok = false;
@@ -1446,8 +1462,33 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
       GetResolveCopyRectanglesToDump(span_base, span_row_length, span_rows, span_pitch,
                                      dump_rectangles_);
-      if (dump_rectangles_.size() == 1) {
+      if (!dump_rectangles_.empty()) {
         const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
+        bool complete = dump_rectangles_.size() == 1 && !rectangle.row_first &&
+                        rectangle.rows == span_rows && !rectangle.row_first_start &&
+                        rectangle.row_last_end == span_row_length;
+        // The EDRAM ownership walker splits at the end of guest memory even
+        // when both parts are stored in one contiguous Vulkan image.
+        if (copying_depth && REXCVAR_GET(resolve_direct_wrapped_depth) &&
+            dump_rectangles_.size() == 2 && span_row_length == span_pitch &&
+            span_base + span_rows * span_pitch > xenos::kEdramTileCount) {
+          const ResolveCopyDumpRectangle& tail = dump_rectangles_.back();
+          const uint32_t boundary = xenos::kEdramTileCount - span_base;
+          const uint32_t head_end =
+              (rectangle.row_first + rectangle.rows - 1) * span_pitch + rectangle.row_last_end;
+          const uint32_t tail_start = tail.row_first * span_pitch + tail.row_first_start;
+          complete = rectangle.render_target == tail.render_target && !rectangle.row_first &&
+                     !rectangle.row_first_start && head_end == boundary &&
+                     tail_start == boundary && tail.row_first + tail.rows == span_rows &&
+                     tail.row_last_end == span_row_length;
+          if (g_frame_dump.active) {
+            FrameDumpEvent(fmt::format(
+                "  direct depth across EDRAM wrap: {} owners, boundary {}, head ends {}, "
+                "tail starts {}, coverage {}",
+                rectangle.render_target == tail.render_target ? 1 : 2, boundary,
+                head_end, tail_start, complete ? "complete" : "partial"));
+          }
+        }
         auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
         const RenderTargetKey rt_key = vulkan_rt.key();
         const bool format_matches =
@@ -1460,9 +1501,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         const uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8)
                                << xenos::kResolveAlignmentPixelsLog2;
         const uint32_t height = resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
-        if (!rectangle.row_first && rectangle.rows == span_rows && !rectangle.row_first_start &&
-            rectangle.row_last_end == span_row_length && format_matches &&
-            rt_key.msaa_samples == edram_info.msaa_samples &&
+        if (complete && format_matches && rt_key.msaa_samples == edram_info.msaa_samples &&
             rt_key.GetPitchTiles() == edram_info.pitch_tiles &&
             edram_info.base_tiles >= rt_key.base_tiles) {
           const uint32_t tile_offset = edram_info.base_tiles - rt_key.base_tiles;
@@ -1486,7 +1525,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
               source_y + height <=
                   GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) &&
               width <= kDirectConvertImageSize && height <= kDirectConvertImageSize &&
-              texture_cache.PrepareDirectResolve(resolve_info, width, height, only_dependents)) {
+              texture_cache.PrepareDirectResolve(resolve_info, width, height, only_dependents) &&
+              GetDirectConvertPipeline(mode, rt_key.msaa_samples != xenos::MsaaSamples::k1X) !=
+                  VK_NULL_HANDLE &&
+              EnsureDirectConvertImage(mode)) {
             direct_source = &vulkan_rt;
             direct_source_x = int32_t(source_x);
             direct_source_y = int32_t(source_y);
@@ -2566,10 +2608,15 @@ VkPipeline VulkanRenderTargetCache::GetDirectConvertPipeline(uint32_t mode, bool
 
 bool VulkanRenderTargetCache::EnsureDirectConvertImage(uint32_t mode) {
   DirectConvertImage& scratch = direct_convert_images_[mode];
+  if (scratch.failed) {
+    // A previous attempt may have allocated the image without creating its
+    // view or descriptor. Treat it as unavailable for the rest of the session.
+    return false;
+  }
   if (scratch.image != VK_NULL_HANDLE) {
     return true;
   }
-  if (scratch.failed || !EnsureDirectConvertLayouts()) {
+  if (!EnsureDirectConvertLayouts()) {
     return false;
   }
   scratch.failed = true;
