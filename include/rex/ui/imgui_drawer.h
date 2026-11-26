@@ -53,6 +53,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // UI thread can skip the round trip entirely.
   bool HasDialogs() const { return !dialogs_.empty(); }
 
+  // The drawer textures are created with (UI thread, during a dialog's draw);
+  // null until the presentation is set up. ImTextureID = ImmediateTexture*.
+  ImmediateDrawer* immediate_drawer() const { return immediate_drawer_; }
+
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
   void SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer);

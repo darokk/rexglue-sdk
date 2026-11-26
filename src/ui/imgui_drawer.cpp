@@ -439,7 +439,17 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   if (!dialogs_.empty()) {
     // Repaint (and handle input) continuously if still active. In detached mode
     // there is no presenter; the app drives repaint via its own present loop.
-    if (presenter_) {
+    // Dialogs that only overlay the game image opt out (see
+    // ImGuiDialog::WantsContinuousRepaint): with only those registered, the
+    // presenter paints once per new game frame, so presents follow the game.
+    bool continuous = false;
+    for (const ImGuiDialog* dialog : dialogs_) {
+      if (dialog->WantsContinuousRepaint()) {
+        continuous = true;
+        break;
+      }
+    }
+    if (presenter_ && continuous) {
       presenter_->RequestUIPaintFromUIThread();
     }
   }

@@ -39,6 +39,14 @@ class ImGuiDialog {
 
   void Draw();
 
+  // Whether the drawer should keep repainting (at the display rate) while this
+  // dialog is registered. A dialog that only overlays the game image and has
+  // nothing to animate between game frames returns false: it is then redrawn
+  // with each new game frame only, so presents (and frame rate counters such
+  // as the Steam overlay's) still follow the game. The drawer repaints
+  // continuously as long as any registered dialog returns true.
+  virtual bool WantsContinuousRepaint() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 
