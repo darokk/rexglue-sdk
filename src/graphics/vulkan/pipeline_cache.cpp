@@ -1234,6 +1234,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   // yet: queued for a creation thread, and the unspecialized pipeline (the
   // signs read from the system constants, correct for any signs) is used until
   // it's ready.
+  auto it = pipelines_.end();
   if (description.texture_signs_fetch_mask && !creation_threads_.empty() &&
       REXCVAR_GET(vulkan_specialize_texture_signs_in_background)) {
     auto specialized_it = pipelines_.find(description);
@@ -1241,7 +1242,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
         specialized_it != pipelines_.end() &&
         specialized_it->second.pipeline.load(std::memory_order_acquire) != VK_NULL_HANDLE &&
         !specialized_it->second.is_placeholder.load(std::memory_order_acquire);
-    if (!specialized_ready) {
+    if (specialized_ready) {
+      it = specialized_it;
+    } else {
       bool specialized_pending = specialized_it != pipelines_.end() &&
                                  background_specialized_pipelines_.count(&specialized_it->second);
       if (specialized_it == pipelines_.end()) {
@@ -1284,7 +1287,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
   const bool skip_draws = REXCVAR_GET(async_shader_compilation) &&
                           REXCVAR_GET(vulkan_async_skip_draws) && !creation_threads_.empty();
 
-  auto it = pipelines_.find(description);
+  if (it == pipelines_.end()) {
+    it = pipelines_.find(description);
+  }
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
     if (found_pipeline == VK_NULL_HANDLE &&
@@ -1412,11 +1417,12 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
     return;
   }
   const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
-  pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
-  pipeline_layout_out = pipeline->pipeline_layout.load(std::memory_order_acquire);
   if (is_placeholder_out) {
+    // Observe readiness before reading the handle it publishes.
     *is_placeholder_out = pipeline->is_placeholder.load(std::memory_order_acquire);
   }
+  pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
+  pipeline_layout_out = pipeline->pipeline_layout.load(std::memory_order_acquire);
 }
 
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
@@ -3754,8 +3760,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
     if (was_placeholder && old_pipeline != VK_NULL_HANDLE) {
       std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-      deferred_destroy_pipelines_.emplace_back(command_processor_.GetCurrentSubmission(),
-                                               old_pipeline);
+      pending_pipeline_destructions_.push_back(old_pipeline);
     }
   }
 
@@ -3813,19 +3818,15 @@ void VulkanPipelineCache::CreateQueuedPipeline(
   if (EnsurePipelineCreated(creation_arguments)) {
     return;
   }
-  bool has_placeholder =
-      creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
-  VkPipeline pipeline =
-      creation_arguments.pipeline->second.pipeline.load(std::memory_order_acquire);
-  if (has_placeholder && pipeline != VK_NULL_HANDLE) {
-    // Keep the placeholder resident and stop waiting for a real pipeline.
-    creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
-  } else {
-    creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE, std::memory_order_release);
-    // Not pending any more (vulkan_async_skip_draws): the next use tries again
-    // on the command processor thread.
-    creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+  auto& pipeline = creation_arguments.pipeline->second;
+  VkPipeline discarded = pipeline.pipeline.exchange(VK_NULL_HANDLE, std::memory_order_acq_rel);
+  if (discarded != VK_NULL_HANDLE) {
+    std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
+    pending_pipeline_destructions_.push_back(discarded);
   }
+  // A null, non-pending pipeline is retried on demand. A failed compilation
+  // must never publish the discard-only placeholder as a usable pipeline.
+  pipeline.is_placeholder.store(false, std::memory_order_release);
 }
 
 bool VulkanPipelineCache::WaitForPipeline(void* handle, uint32_t timeout_ms) {
@@ -3893,8 +3894,14 @@ void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
   uint64_t completed_submission = command_processor_.GetCompletedSubmission();
   {
     std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-    if (deferred_destroy_pipelines_.empty()) {
-      return;
+    // Workers publish handles only. Submission state belongs to this thread,
+    // and a draw that saw the old handle can be in the current submission.
+    if (!pending_pipeline_destructions_.empty()) {
+      const uint64_t current_submission = command_processor_.GetCurrentSubmission();
+      for (VkPipeline pipeline : pending_pipeline_destructions_) {
+        deferred_destroy_pipelines_.emplace_back(current_submission, pipeline);
+      }
+      pending_pipeline_destructions_.clear();
     }
     auto it = deferred_destroy_pipelines_.begin();
     while (it != deferred_destroy_pipelines_.end()) {

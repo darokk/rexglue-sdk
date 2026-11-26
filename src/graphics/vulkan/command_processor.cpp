@@ -2424,6 +2424,11 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+REXCVAR_DEFINE_BOOL(vulkan_skip_unchanged_constants, true, "GPU/Vulkan",
+                    "Keep clean float and bool/loop buffers when a guest bulk write "
+                    "repeats their current register bits")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                                    uint32_t num_registers) {
   if (!num_registers) {
@@ -2457,9 +2462,33 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     return (usage_map[last_word] & last_mask) != 0;
   };
 
+  auto copy_if_changed = [&](uint32_t clean_buffers) {
+    uint32_t* dest = register_file_->values + start_index;
+    if (!(current_constant_buffers_up_to_date_ & clean_buffers) ||
+        !REXCVAR_GET(vulkan_skip_unchanged_constants)) {
+      memory::copy_and_swap(dest, base, num_registers);
+      return true;
+    }
+
+    uint32_t differences = 0;
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      uint32_t value;
+      std::memcpy(&value, base + i, sizeof(value));
+      value = rex::byte_swap(value);
+      differences |= dest[i] ^ value;
+      dest[i] = value;
+    }
+    return differences != 0;
+  };
+
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    constexpr uint32_t kFloatBuffers =
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex) |
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+    if (!copy_if_changed(frame_open_ ? kFloatBuffers : 0)) {
+      return;
+    }
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
@@ -2487,9 +2516,10 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    current_constant_buffers_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
+    constexpr uint32_t kBoolLoopBuffer = UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop;
+    if (copy_if_changed(kBoolLoopBuffer)) {
+      current_constant_buffers_up_to_date_ &= ~kBoolLoopBuffer;
+    }
     return;
   }
 
@@ -4304,7 +4334,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+  if (REXCVAR_GET(async_shader_compilation) &&
+      (pipeline_is_placeholder || pipeline == VK_NULL_HANDLE)) {
     // Drawing with the placeholder (which discards every pixel) leaves objects
     // missing for that frame and corrupts any texture rendered by the pass, so
     // wait for the real pipeline instead, as on D3D12. Only the first use of a
@@ -5525,6 +5556,7 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
 }
 
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+  ScopedStreamingTiming timing(StreamingStage::kSubmissionWait);
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
     return;

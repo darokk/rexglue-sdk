@@ -80,6 +80,11 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_poll_us, 200, "GPU",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(log_perf_streaming, false, "GPU",
+                    "With log_guest_fps, time CPU texture streaming phases on the slowest "
+                    "guest frame in each window")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(log_perf_file, false, "GPU",
                     "With log_guest_fps, also write the 5-second summaries, with CPU time per "
                     "thread and CPU/GPU clocks, to perf_log.txt next to the executable "
@@ -1924,7 +1929,15 @@ void FrameDumpOnSwap() {
 
 }  // namespace
 
+bool IsStreamingTimingEnabled() {
+  return REXCVAR_GET(log_perf_streaming) && REXCVAR_GET(log_guest_fps);
+}
+
 void CommandProcessor::LogGuestFrameTiming() {
+  static thread_local StreamingTimes slowest_streaming_times;
+  const bool time_streaming = IsStreamingTimingEnabled();
+  const StreamingTimes frame_streaming_times =
+      time_streaming ? std::exchange(g_streaming_times, {}) : StreamingTimes{};
   FrameDumpOnSwap();
   using Clock = std::chrono::steady_clock;
   if (!REXCVAR_GET(log_guest_fps)) {
@@ -1955,6 +1968,7 @@ void CommandProcessor::LogGuestFrameTiming() {
       g_frame_events.shader_translations.load(std::memory_order_relaxed),
       g_frame_events.pipelines_created.load(std::memory_order_relaxed)};
   if (frame > fps_log_worst_) {
+    slowest_streaming_times = frame_streaming_times;
     for (int i = 0; i < 4; ++i) {
       fps_log_worst_events_[i] = events_now[i] - fps_log_events_last_[i];
     }
@@ -1987,7 +2001,7 @@ void CommandProcessor::LogGuestFrameTiming() {
     // GPU execution time per guest frame (the GPU is the limit when this is
     // close to the frame time).
     const std::string gpu_time = TakeGpuTimeReport(fps_log_frames_);
-    const std::string line = fmt::format(
+    std::string line = fmt::format(
         "{:.1f} fps over {:.1f} s, slowest frame {:.1f} ms ({} texture loads, {} KB uploaded, "
         "{} shaders translated, {} pipelines created), {} of {} frames over 33 ms; host "
         "presented {:.1f}/s{}; GPU waits: {}",
@@ -1996,6 +2010,18 @@ void CommandProcessor::LogGuestFrameTiming() {
         fps_log_worst_events_[0], fps_log_worst_events_[1] / 1024, fps_log_worst_events_[2],
         fps_log_worst_events_[3], fps_log_slow_frames_, fps_log_frames_,
         (presents - fps_log_presents_) / seconds, gpu_time, syncs.empty() ? "none" : syncs);
+    if (time_streaming) {
+      static constexpr const char* kStages[] = {
+          "requests", "page protection", "hash", "staging", "copy",
+          "conversion commands", "submission fence checks/waits"};
+      static_assert(std::size(kStages) == size_t(StreamingStage::kCount));
+      line += "; CPU streaming on slowest frame (ms, inclusive)";
+      for (size_t i = 0; i < std::size(kStages); ++i) {
+        line += fmt::format(", {} {:.3f}", kStages[i],
+                           std::chrono::duration<double, std::milli>(slowest_streaming_times[i])
+                               .count());
+      }
+    }
     REXGPU_INFO("[guest-fps] {}", line);
     if (!host.empty()) {
       REXGPU_INFO("[host-perf] {}", host);

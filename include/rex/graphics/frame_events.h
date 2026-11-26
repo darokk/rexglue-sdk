@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 namespace rex::graphics {
@@ -69,5 +71,39 @@ inline FrameEvents g_frame_events;
 inline void CountFrameEvent(std::atomic<uint64_t>& counter, uint64_t amount = 1) {
   counter.fetch_add(amount, std::memory_order_relaxed);
 }
+
+// CPU wall time on the GPU command thread, grouped by work done between swaps.
+enum class StreamingStage : size_t {
+  kTextureRequests,
+  kPageProtection,
+  kHash,
+  kStaging,
+  kCopy,
+  kTextureConversionCommands,
+  kSubmissionWait,
+  kCount,
+};
+using StreamingTimes = std::array<std::chrono::steady_clock::duration,
+                                  size_t(StreamingStage::kCount)>;
+inline thread_local StreamingTimes g_streaming_times;
+
+bool IsStreamingTimingEnabled();
+
+class ScopedStreamingTiming {
+ public:
+  explicit ScopedStreamingTiming(StreamingStage stage, bool enabled = IsStreamingTimingEnabled())
+      : stage_(stage), started_(enabled ? Clock::now() : Clock::time_point{}) {}
+
+  ~ScopedStreamingTiming() {
+    if (started_ != Clock::time_point{}) {
+      g_streaming_times[size_t(stage_)] += Clock::now() - started_;
+    }
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  StreamingStage stage_;
+  Clock::time_point started_;
+};
 
 }  // namespace rex::graphics

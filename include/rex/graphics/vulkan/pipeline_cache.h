@@ -448,6 +448,7 @@ class VulkanPipelineCache {
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
   // <Submission index, pipeline>.
+  std::vector<VkPipeline> pending_pipeline_destructions_;
   std::deque<std::pair<uint64_t, VkPipeline>> deferred_destroy_pipelines_;
   std::mutex deferred_destroy_lock_;
 

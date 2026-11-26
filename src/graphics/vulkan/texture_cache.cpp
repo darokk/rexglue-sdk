@@ -575,6 +575,7 @@ void VulkanTextureCache::EndFrame() {
 }
 
 void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
+  ScopedStreamingTiming timing(StreamingStage::kTextureRequests);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -1566,6 +1567,7 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  ScopedStreamingTiming timing(StreamingStage::kTextureConversionCommands);
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
 

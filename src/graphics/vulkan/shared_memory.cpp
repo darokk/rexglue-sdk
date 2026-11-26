@@ -378,14 +378,19 @@ bool VulkanSharedMemory::UploadRanges(
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
   const uint32_t page_size = uint32_t(1) << page_size_log2();
   const bool skip_unchanged = REXCVAR_GET(shared_memory_skip_unchanged_uploads);
+  const bool time_streaming = IsStreamingTimingEnabled();
   // Copies [run_start, run_start + run_length) pages to the GPU buffer.
   auto copy_run = [&](uint32_t run_start, uint32_t run_length) -> bool {
     while (run_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
-      uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
-          submission_current, run_length << page_size_log2(), page_size, upload_buffer,
-          upload_buffer_offset, upload_buffer_size);
+      uint8_t* upload_buffer_mapping;
+      {
+        ScopedStreamingTiming timing(StreamingStage::kStaging, time_streaming);
+        upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
+            submission_current, run_length << page_size_log2(), page_size, upload_buffer,
+            upload_buffer_offset, upload_buffer_size);
+      }
       if (upload_buffer_mapping == nullptr) {
         REXGPU_ERROR("Shared memory: Failed to get a Vulkan upload buffer");
         // Not copied: make them be requested again.
@@ -394,8 +399,11 @@ bool VulkanSharedMemory::UploadRanges(
         return false;
       }
       CountFrameEvent(g_frame_events.upload_bytes, upload_buffer_size);
-      std::memcpy(upload_buffer_mapping, memory().TranslatePhysical(run_start << page_size_log2()),
-                  upload_buffer_size);
+      {
+        ScopedStreamingTiming timing(StreamingStage::kCopy, time_streaming);
+        std::memcpy(upload_buffer_mapping, memory().TranslatePhysical(run_start << page_size_log2()),
+                    upload_buffer_size);
+      }
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -418,8 +426,11 @@ bool VulkanSharedMemory::UploadRanges(
     const uint32_t range_end = upload_range.first + upload_range.second;
     // Protect (and mark valid) first, then read the guest data: a write after
     // this point is caught by the protection and invalidates the pages again.
-    MakeRangeValid(range_start << page_size_log2(), upload_range.second << page_size_log2(),
-                   false);
+    {
+      ScopedStreamingTiming timing(StreamingStage::kPageProtection, time_streaming);
+      MakeRangeValid(range_start << page_size_log2(), upload_range.second << page_size_log2(),
+                     false);
+    }
     // Copy only the pages whose guest data differs from what the GPU copy was
     // last uploaded with (unchanged pages are common: a CPU write invalidates
     // the 256 KB around it, and with it unrelated pages and textures).
@@ -428,6 +439,7 @@ bool VulkanSharedMemory::UploadRanges(
       uint64_t& page_hash = page_content_hash(page);
       bool changed = true;
       if (skip_unchanged) {
+        ScopedStreamingTiming timing(StreamingStage::kHash, time_streaming);
         uint64_t hash =
             XXH3_64bits(memory().TranslatePhysical(page << page_size_log2()), page_size);
         hash = hash ? hash : 1;
