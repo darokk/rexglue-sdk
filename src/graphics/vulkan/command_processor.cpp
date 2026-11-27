@@ -59,6 +59,7 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DECLARE(bool, gpu_sync_at_frame_start);
+REXCVAR_DECLARE(bool, log_guest_fps);
 REXCVAR_DEFINE_BOOL(vulkan_async_submit, true, "GPU/Vulkan",
                     "Replay recorded GPU commands into Vulkan and submit them on a separate "
                     "thread, so the driver's command recording cost leaves the GPU command "
@@ -99,9 +100,13 @@ REXCVAR_DEFINE_BOOL(log_perf_gpu_shaders, false, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(log_perf_gpu_passes, false, "GPU/Vulkan",
-                    "With log_perf_file, also split the GPU time of plain draws by the "
+                    "With log_perf_gpu_timestamps, also split the GPU time of plain draws by the "
                     "render targets they draw to (pitch, samples, color 0 and depth "
                     "format), into the performance log")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(log_perf_gpu_timestamps, false, "GPU/Vulkan",
+                    "With log_guest_fps, include Vulkan GPU timing in the performance report")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(edram_merge_tiles_early, true, "GPU/Vulkan",
@@ -4631,7 +4636,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // The draw itself, for the GPU time breakdown.
   SetGpuTimeCategory(primitive_processing_result.IsTessellated() ? kGpuTimeTessellation
                      : memexport_writes_possible                  ? kGpuTimeMemexport
-                     : REXCVAR_GET(log_perf_gpu_passes) && gpu_timestamp_pool_ != VK_NULL_HANDLE
+                     : record_gpu_timestamps_ && REXCVAR_GET(log_perf_gpu_passes)
                          ? (gpu_pass_shader_vs_ = vertex_shader->ucode_data_hash(),
                             gpu_pass_shader_ps_ = pixel_shader ? pixel_shader->ucode_data_hash() : 0,
                             GetGpuTimePassCategory(normalized_color_mask, normalized_depth_control))
@@ -5830,7 +5835,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     deferred_command_buffer_ = &submit_job_current_->deferred;
     upload_command_buffer_ = &submit_job_current_->upload;
-    if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+    record_gpu_timestamps_ = submit_job_current_->timestamp_slot != UINT32_MAX;
+    if (record_gpu_timestamps_) {
       deferred_command_buffer_->SetTimestampCategory(gpu_time_category_);
     }
 
@@ -6075,6 +6081,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     fences_free_.pop_back();
 
     submit_job_current_ = nullptr;
+    record_gpu_timestamps_ = false;
     deferred_command_buffer_ = closed_command_buffer_.get();
     upload_command_buffer_ = closed_command_buffer_.get();
     closed_command_buffer_->Reset();
@@ -6175,7 +6182,9 @@ VulkanCommandProcessor::SubmitJob* VulkanCommandProcessor::AcquireSubmitJob() {
   job->recording = false;
   job->cursor = {};
   job->timestamp_slot = UINT32_MAX;
-  if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+  // Apply hot changes at submission boundaries so pending queries keep their slots.
+  if (gpu_timestamp_pool_ != VK_NULL_HANDLE && REXCVAR_GET(log_guest_fps) &&
+      REXCVAR_GET(log_perf_gpu_timestamps)) {
     job->timestamp_slot = gpu_timestamp_slot_next_;
     gpu_timestamp_slot_next_ = (gpu_timestamp_slot_next_ + 1) % kGpuTimestampSlots;
   }
@@ -6241,13 +6250,17 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
     total_ns += ns;
   }
   auto ms_per_frame = [frames](uint64_t ns) { return double(ns) / 1e6 / double(frames); };
-  std::string report = fmt::format("; GPU work {:.1f} ms per frame (", ms_per_frame(total_ns));
-  for (uint32_t i = 0; i < kGpuTimeCategoryCount; ++i) {
-    report += fmt::format("{}{} {:.1f}", i ? ", " : "", kCategoryNames[i],
-                          ms_per_frame(gpu_category_ns_[i]));
-    gpu_category_ns_[i] = 0;
+  const bool report_timing = total_ns && REXCVAR_GET(log_perf_gpu_timestamps);
+  std::string report;
+  if (report_timing) {
+    report = fmt::format("; GPU work {:.1f} ms per frame (", ms_per_frame(total_ns));
+    for (uint32_t i = 0; i < kGpuTimeCategoryCount; ++i) {
+      report += fmt::format("{}{} {:.1f}", i ? ", " : "", kCategoryNames[i],
+                            ms_per_frame(gpu_category_ns_[i]));
+    }
+    report += ")";
   }
-  report += ")";
+  std::fill(std::begin(gpu_category_ns_), std::end(gpu_category_ns_), 0);
 
   // Plain draws by render target layout (log_perf_gpu_passes), the most
   // expensive first.
@@ -6258,7 +6271,7 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
       order[order_count++] = i;
     }
   }
-  if (order_count) {
+  if (report_timing && order_count) {
     std::sort(order, order + order_count,
               [this](uint32_t a, uint32_t b) { return gpu_pass_ns_[a] > gpu_pass_ns_[b]; });
     report += "\n         GPU draws by render targets (ms, draws per frame):";

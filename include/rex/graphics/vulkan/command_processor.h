@@ -179,7 +179,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   void SetGpuTimeCategory(uint32_t category) {
     gpu_time_category_ = category;
-    if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+    if (record_gpu_timestamps_) {
       deferred_command_buffer_->SetTimestampCategory(category);
     }
   }
@@ -702,6 +702,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   static constexpr uint32_t kGpuTimestampSlots = 64;
   static constexpr uint32_t kGpuTimestampsPerSlot = 1024;
   VkQueryPool gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  bool record_gpu_timestamps_ = false;
   uint32_t gpu_timestamp_slot_next_ = 0;
   // Written by the submission worker before submitting, read on completion:
   // the category of each timestamp of a slot, and how many were written.

@@ -34,6 +34,7 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 void DeferredCommandBuffer::Reset() {
   write_block_ = 0;
   write_offset_ = 0;
+  timestamp_category_ = kNoTimestampCategory;
   timestamp_category_marked_ = kNoTimestampCategory;
   published_.store(0, std::memory_order_relaxed);
 }
