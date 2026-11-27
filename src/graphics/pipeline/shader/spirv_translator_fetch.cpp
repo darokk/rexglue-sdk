@@ -1476,10 +1476,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        const bool implicit_lod = REXCVAR_GET(spirv_experiment_implicit_lod) &&
-                                  is_pixel_shader() && use_computed_lod &&
-                                  !instr.attributes.use_register_gradients &&
-                                  instr.dimension != xenos::FetchOpDimension::k3DOrStacked;
+        // On NVIDIA's proprietary driver, explicit coarse cube gradients can produce
+        // a grid of bright pixels on reflective materials. Let the sampler compute
+        // the footprint for guest-computed cube LODs and pass the guest bias through.
+        const bool use_implicit_cube_lod =
+            features_.use_implicit_cube_lod && instr.dimension == xenos::FetchOpDimension::kCube;
+        const bool implicit_lod =
+            is_pixel_shader() && use_computed_lod && !instr.attributes.use_register_gradients &&
+            instr.dimension != xenos::FetchOpDimension::k3DOrStacked &&
+            (use_implicit_cube_lod || REXCVAR_GET(spirv_experiment_implicit_lod));
         if (use_computed_lod && !implicit_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the

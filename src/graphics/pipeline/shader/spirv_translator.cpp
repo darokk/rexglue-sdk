@@ -78,6 +78,7 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       clip_distance(vulkan_device->properties().shaderClipDistance),
       cull_distance(vulkan_device->properties().shaderCullDistance),
       image_view_format_swizzle(vulkan_device->properties().imageViewFormatSwizzle),
+      use_implicit_cube_lod(vulkan_device->properties().driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY),
       signed_zero_inf_nan_preserve_float32(
           vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32),
       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
