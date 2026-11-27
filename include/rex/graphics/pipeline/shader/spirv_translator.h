@@ -396,6 +396,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool cull_distance;
 
     bool image_view_format_swizzle;
+    bool use_implicit_cube_lod = false;
 
     bool signed_zero_inf_nan_preserve_float32;
     bool denorm_flush_to_zero_float32;
