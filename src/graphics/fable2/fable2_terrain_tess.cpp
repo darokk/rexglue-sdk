@@ -5,9 +5,16 @@
 #include <cstring>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
+#include <rex/logging.h>
 #include <rex/types.h>
+
+REXCVAR_DEFINE_INT32(terrain_tess_simd, 1, "GPU",
+                     "Fable II terrain kernel: 0 scalar, 1 four-vertex SIMD, 2 verify SIMD against scalar")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::fable2 {
 
@@ -25,6 +32,23 @@ void RunTerrainTessVS(float r[16][4], const ConstantFn& C, const SampleFn& sampl
 #include "fable2_terrain_tess_vs.inc"
 }
 
+#if REX_COMPILER_CLANG
+using TerrainFloat = float __attribute__((ext_vector_type(4)));
+using TerrainMask = int32_t __attribute__((ext_vector_type(4)));
+
+bool AnyLane(TerrainMask mask) { return __builtin_reduce_or(mask) != 0; }
+
+TerrainFloat TerrainMin(TerrainFloat a, TerrainFloat b) { return b < a ? b : a; }
+TerrainFloat TerrainMax(TerrainFloat a, TerrainFloat b) { return a < b ? b : a; }
+
+template <typename ConstantFn, typename SampleFn>
+void RunTerrainTessVSSimd(TerrainFloat r[16][4], const ConstantFn& C, const SampleFn& sample) {
+  TerrainMask p0 = {};
+  TerrainFloat ps = {};
+#include "fable2_terrain_tess_vs_simd.inc"
+}
+#endif
+
 float ReadBigEndianFloat(const uint8_t* bytes) {
   uint32_t value;
   std::memcpy(&value, bytes, sizeof(value));
@@ -32,6 +56,35 @@ float ReadBigEndianFloat(const uint8_t* bytes) {
   float result;
   std::memcpy(&result, &value, sizeof(result));
   return result;
+}
+
+template <typename Value, typename Read>
+void LoadTerrainInputs(Value r[16][4], Value index, const Read& read) {
+  const auto fetch = [&](uint32_t reg, uint32_t attribute, uint32_t count, uint32_t first) {
+    for (uint32_t i = 0; i < count; ++i) {
+      r[reg][first + i] = read(attribute * 16 + i * 4);
+    }
+  };
+  fetch(13, 0, 4, 0);
+  fetch(12, 1, 4, 0);
+  fetch(11, 2, 4, 0);
+  fetch(10, 3, 4, 0);
+  fetch(5, 4, 3, 0);
+  fetch(3, 5, 3, 0);
+  fetch(4, 6, 3, 0);
+  fetch(7, 7, 3, 0);
+  fetch(9, 8, 3, 0);
+  fetch(8, 9, 3, 0);
+  fetch(0, 10, 3, 1);
+  fetch(6, 11, 3, 0);
+  r[0][0] = index;
+}
+
+void StoreTerrainFactor(uint8_t* dest, float factor) {
+  uint32_t value;
+  std::memcpy(&value, &factor, sizeof(value));
+  value = rex::byte_swap(value);
+  std::memcpy(dest, &value, sizeof(value));
 }
 
 }  // namespace
@@ -123,36 +176,76 @@ bool ComputeFable2TerrainTess(const RegisterFile& regs, memory::Memory& memory,
 
   static thread_local std::vector<uint8_t> output;
   output.resize(size_t(vertex_count) * kOutputBytes);
-  for (uint32_t vertex = 0; vertex < vertex_count; ++vertex) {
-    const uint32_t index = vertex + index_offset;
+  const auto compute_scalar = [&](uint32_t index, uint8_t* element) {
     const uint8_t* attributes = vertices + size_t(index) * kVertexBytes;
     float r[16][4] = {};
-    const auto fetch = [&](uint32_t reg, uint32_t attribute, uint32_t count, uint32_t first) {
-      for (uint32_t i = 0; i < count; ++i) {
-        r[reg][first + i] = ReadBigEndianFloat(attributes + attribute * 16 + i * 4);
-      }
-    };
-    fetch(13, 0, 4, 0);
-    fetch(12, 1, 4, 0);
-    fetch(11, 2, 4, 0);
-    fetch(10, 3, 4, 0);
-    fetch(5, 4, 3, 0);
-    fetch(3, 5, 3, 0);
-    fetch(4, 6, 3, 0);
-    fetch(7, 7, 3, 0);
-    fetch(9, 8, 3, 0);
-    fetch(8, 9, 3, 0);
-    fetch(0, 10, 3, 1);
-    fetch(6, 11, 3, 0);
-    r[0][0] = float(index);
+    LoadTerrainInputs(r, float(index), [&](uint32_t offset) {
+      return ReadBigEndianFloat(attributes + offset);
+    });
     RunTerrainTessVS(r, LC, sample);
-    uint8_t* element = output.data() + size_t(vertex) * kOutputBytes;
     for (uint32_t i = 0; i < 4; ++i) {
-      uint32_t value;
-      std::memcpy(&value, &r[1][i], sizeof(value));
-      value = rex::byte_swap(value);
-      std::memcpy(element + i * 4, &value, sizeof(value));
+      StoreTerrainFactor(element + i * 4, r[1][i]);
     }
+  };
+  uint32_t vertex = 0;
+#if REX_COMPILER_CLANG
+  const int32_t simd_mode = REXCVAR_GET(terrain_tess_simd);
+  if (simd_mode) {
+    const auto vector_constant = [&](uint32_t index, uint32_t component) -> TerrainFloat {
+      return (TerrainFloat)LC(index, component);
+    };
+    const auto vector_sample = [&](TerrainMask active, TerrainFloat u, TerrainFloat v,
+                                   uint32_t component) {
+      TerrainFloat result = {};
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        if (active[lane]) {
+          result[lane] = sample(u[lane], v[lane], component);
+        }
+      }
+      return result;
+    };
+    static thread_local uint64_t checked_vertices = 0;
+    static thread_local uint64_t mismatched_batches = 0;
+    for (; vertex + 4 <= vertex_count; vertex += 4) {
+      const uint32_t index = vertex + index_offset;
+      const uint8_t* attributes = vertices + size_t(index) * kVertexBytes;
+      TerrainFloat r[16][4] = {};
+      LoadTerrainInputs(r, TerrainFloat{float(index), float(index + 1), float(index + 2),
+                                       float(index + 3)}, [&](uint32_t offset) {
+        return TerrainFloat{ReadBigEndianFloat(attributes + offset),
+                            ReadBigEndianFloat(attributes + kVertexBytes + offset),
+                            ReadBigEndianFloat(attributes + 2 * kVertexBytes + offset),
+                            ReadBigEndianFloat(attributes + 3 * kVertexBytes + offset)};
+      });
+      RunTerrainTessVSSimd(r, vector_constant, vector_sample);
+      uint8_t* elements = output.data() + size_t(vertex) * kOutputBytes;
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        for (uint32_t component = 0; component < 4; ++component) {
+          StoreTerrainFactor(elements + lane * kOutputBytes + component * 4, r[1][component][lane]);
+        }
+      }
+      if (simd_mode == 2) {
+        uint8_t scalar[4 * kOutputBytes];
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+          compute_scalar(index + lane, scalar + lane * kOutputBytes);
+        }
+        if (std::memcmp(elements, scalar, sizeof(scalar)) != 0) {
+          std::memcpy(elements, scalar, sizeof(scalar));
+          if (++mismatched_batches == 1) {
+            REXGPU_WARN("Terrain SIMD output mismatch at vertex {}", index);
+          }
+        }
+        checked_vertices += 4;
+        if ((checked_vertices & 0xFFFF) == 0) {
+          REXGPU_WARN("Terrain SIMD checked {} vertices, {} mismatched batches", checked_vertices,
+                      mismatched_batches);
+        }
+      }
+    }
+  }
+#endif
+  for (; vertex < vertex_count; ++vertex) {
+    compute_scalar(vertex + index_offset, output.data() + size_t(vertex) * kOutputBytes);
   }
   std::memcpy(destination, output.data(), output.size());
   written_start = destination_address;
